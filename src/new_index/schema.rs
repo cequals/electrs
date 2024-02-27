@@ -299,6 +299,7 @@ impl Indexer {
             self.from = FetchFrom::Bitcoind;
         }
 
+        debug!("tip height should be published! {:?}", headers.len() - 1);
         self.tip_metric.set(headers.len() as i64 - 1);
 
         Ok(tip)

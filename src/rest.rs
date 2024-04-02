@@ -54,6 +54,8 @@ const TTL_SHORT: u32 = 10; // ttl for volatie resources
 const TTL_MEMPOOL_RECENT: u32 = 5; // ttl for GET /mempool/recent
 const CONF_FINAL: usize = 10; // reorgs deeper than this are considered unlikely
 
+const CORS_ALLOWED_ORIGIN: &str = "*";
+
 #[derive(Serialize, Deserialize)]
 struct BlockValue {
     id: String,
@@ -536,7 +538,7 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                             Response::builder()
                                 .status(err.0)
                                 .header("Content-Type", "text/plain")
-                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN)
                                 .body(Body::from(err.1))
                                 .unwrap()
                         });
@@ -707,7 +709,7 @@ fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/octet-stream")
                 .header("Cache-Control", format!("public, max-age={:}", TTL_LONG))
-                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN)
                 .body(Body::from(raw))
                 .unwrap())
         }
@@ -937,7 +939,7 @@ fn handle_request(
                 .status(StatusCode::OK)
                 .header("Content-Type", content_type)
                 .header("Cache-Control", format!("public, max-age={:}", ttl))
-                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN)
                 .body(body)
                 .unwrap())
         }
@@ -1067,7 +1069,7 @@ fn handle_request(
                 .header("Cache-Control", "no-store")
                 .header("Content-Type", "application/json")
                 .header("X-Total-Results", total_num.to_string())
-                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN)
                 .body(Body::from(serde_json::to_string(&assets)?))
                 .unwrap())
         }
@@ -1178,7 +1180,7 @@ where
         .status(status)
         .header("Content-Type", "text/plain")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
-        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN)
         .body(message.into())
         .unwrap())
 }
@@ -1188,7 +1190,7 @@ fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, Htt
     Ok(Response::builder()
         .header("Content-Type", "application/json")
         .header("Cache-Control", format!("public, max-age={:}", ttl))
-        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN)
         .body(Body::from(value))
         .unwrap())
 }

@@ -87,6 +87,7 @@ impl TestRunner {
         let config = Arc::new(Config {
             log,
             network_type,
+            signet_magic: None,
             db_path: electrsdb.path().to_path_buf(),
             daemon_dir: daemon_subdir.clone(),
             blocks_dir: daemon_subdir.join("blocks"),
@@ -109,6 +110,8 @@ impl TestRunner {
 
             #[cfg(feature = "liquid")]
             asset_db_path: None, // XXX
+            electrum_public_hosts: None,
+            electrum_announce: false,
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
             //#[cfg(feature = "electrum-discovery")]
@@ -117,6 +120,7 @@ impl TestRunner {
             //electrum_announce: bool,
             //#[cfg(feature = "electrum-discovery")]
             //tor_proxy: Option<std::net::SocketAddr>,
+            tor_proxy: None,
         });
 
         let signal = Waiter::start();
@@ -129,6 +133,7 @@ impl TestRunner {
             config.daemon_rpc_addr,
             config.cookie_getter(),
             config.network_type,
+            config.signet_magic,
             signal.clone(),
             &metrics,
         )?);

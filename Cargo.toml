@@ -49,6 +49,7 @@ signal-hook = "0.3"
 stderrlog = "0.5.0"
 sysconf = ">=0.3.4"
 time = { version = "0.3", features = ["formatting"] }
+tikv-jemallocator = { version = "0.5.4" }
 tiny_http = "0.11"
 url = "2.2.0"
 hyper = "0.14"

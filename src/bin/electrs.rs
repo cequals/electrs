@@ -1,3 +1,8 @@
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 extern crate error_chain;
 #[macro_use]
 extern crate log;

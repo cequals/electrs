@@ -3,7 +3,7 @@ use rocksdb;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::util::Bytes;
+use crate::util::{bincode, Bytes};
 
 static DB_VERSION: u32 = 1;
 
@@ -26,7 +26,7 @@ impl<'a> Iterator for ScanIterator<'a> {
         if self.done {
             return None;
         }
-        let (key, value) = self.iter.next()?;
+        let (key, value) = self.iter.next()?.expect("valid iterator");
         if !key.starts_with(&self.prefix) {
             self.done = true;
             return None;
@@ -197,7 +197,7 @@ impl DB {
     }
 
     fn verify_compatibility(&self, config: &Config) {
-        let mut compatibility_bytes = bincode::serialize(&DB_VERSION).unwrap();
+        let mut compatibility_bytes = bincode::serialize_little(&DB_VERSION).unwrap();
 
         if config.light_mode {
             // append a byte to indicate light_mode is enabled.

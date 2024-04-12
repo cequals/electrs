@@ -1,5 +1,7 @@
 use rayon::prelude::*;
 
+#[cfg(feature = "liquid")]
+use crate::elements::ebcompact::*;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::{deserialize, Decodable};
 #[cfg(feature = "liquid")]
@@ -88,7 +90,7 @@ fn bitcoind_fetcher(
                     .zip(entries)
                     .map(|(block, entry)| BlockEntry {
                         entry: entry.clone(), // TODO: remove this clone()
-                        size: block.size() as u32,
+                        size: block.total_size() as u32,
                         block,
                     })
                     .collect();

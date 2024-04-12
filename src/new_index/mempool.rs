@@ -8,7 +8,7 @@ use elements::{encode::serialize, AssetId};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
@@ -17,8 +17,8 @@ use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{GaugeVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{
-    compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, ScriptStats, SpendingInfo,
-    SpendingInput, TxHistoryInfo, Utxo,
+    compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, GetAmountVal, ScriptStats,
+    SpendingInfo, SpendingInput, TxHistoryInfo, Utxo,
 };
 use crate::util::fees::{make_fee_histogram, TxFeeInfo};
 use crate::util::{extract_tx_prevouts, full_hash, has_prevout, is_spendable, Bytes};
@@ -36,7 +36,7 @@ pub struct Mempool {
     feeinfo: HashMap<Txid, TxFeeInfo>,
     history: HashMap<FullHash, Vec<TxHistoryInfo>>, // ScriptHash -> {history_entries}
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
-    recent: ArrayDeque<[TxOverview; RECENT_TXS_SIZE], Wrapping>, // The N most recent txs to enter the mempool
+    recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
     backlog_stats: (BacklogStats, Instant),
 
     // monitoring
@@ -56,7 +56,7 @@ pub struct Mempool {
 pub struct TxOverview {
     txid: Txid,
     fee: u64,
-    vsize: u32,
+    vsize: u64,
     #[cfg(not(feature = "liquid"))]
     value: u64,
 }
@@ -276,42 +276,16 @@ impl Mempool {
         &self.backlog_stats.0
     }
 
-    pub fn update(&mut self, daemon: &Daemon) -> Result<()> {
-        let _timer = self.latency.with_label_values(&["update"]).start_timer();
-        let new_txids = daemon
-            .getmempooltxids()
-            .chain_err(|| "failed to update mempool from daemon")?;
-        let old_txids = HashSet::from_iter(self.txstore.keys().cloned());
-        let to_remove: HashSet<&Txid> = old_txids.difference(&new_txids).collect();
+    pub fn old_txids(&self) -> HashSet<Txid> {
+        return HashSet::from_iter(self.txstore.keys().cloned());
+    }
 
-        // Download and add new transactions from bitcoind's mempool
-        let txids: Vec<&Txid> = new_txids.difference(&old_txids).collect();
-        let to_add = match daemon.gettransactions(&txids) {
-            Ok(txs) => txs,
-            Err(err) => {
-                warn!("failed to get {} transactions: {}", txids.len(), err); // e.g. new block or RBF
-                return Ok(()); // keep the mempool until next update()
-            }
-        };
-        // Add new transactions
-        self.add(to_add);
-        // Remove missing transactions
-        self.remove(to_remove);
-
-        self.count
-            .with_label_values(&["txs"])
-            .set(self.txstore.len() as f64);
-
-        // Update cached backlog stats (if expired)
-        if self.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
-            let _timer = self
-                .latency
-                .with_label_values(&["update_backlog_stats"])
-                .start_timer();
-            self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
-        }
-
-        Ok(())
+    pub fn update_backlog_stats(&mut self) {
+        let _timer = self
+            .latency
+            .with_label_values(&["update_backlog_stats"])
+            .start_timer();
+        self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
     }
 
     pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) {
@@ -358,7 +332,10 @@ impl Mempool {
                 fee: feeinfo.fee,
                 vsize: feeinfo.vsize,
                 #[cfg(not(feature = "liquid"))]
-                value: prevouts.values().map(|prevout| prevout.value).sum(),
+                value: prevouts
+                    .values()
+                    .map(|prevout| prevout.value.to_sat())
+                    .sum(),
             });
 
             self.feeinfo.insert(txid, feeinfo);
@@ -373,7 +350,7 @@ impl Mempool {
                         vin: input_index as u16,
                         prev_txid: full_hash(&txi.previous_output.txid[..]),
                         prev_vout: txi.previous_output.vout as u16,
-                        value: prevout.value,
+                        value: prevout.value.amount_value(),
                     }),
                 )
             });
@@ -392,7 +369,7 @@ impl Mempool {
                         TxHistoryInfo::Funding(FundingInfo {
                             txid: txid_bytes,
                             vout: index as u16,
-                            value: txo.value,
+                            value: txo.value.amount_value(),
                         }),
                     )
                 });
@@ -513,14 +490,59 @@ impl Mempool {
             .get(asset_id)
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
     }
+
+    pub fn update(mempool: &Arc<RwLock<Mempool>>, daemon: &Daemon) -> Result<()> {
+        let _timer = mempool
+            .read()
+            .unwrap()
+            .latency
+            .with_label_values(&["update"])
+            .start_timer();
+
+        // 1. Determine which transactions are no longer in the daemon's mempool and which ones have newly entered it
+        let old_txids = mempool.read().unwrap().old_txids();
+        let all_txids = daemon
+            .getmempooltxids()
+            .chain_err(|| "failed to update mempool from daemon")?;
+        let txids_to_remove: HashSet<&Txid> = old_txids.difference(&all_txids).collect();
+
+        // 2. Remove missing transactions. Even if we are unable to download new transactions from
+        // the daemon, we still want to remove the transactions that are no longer in the mempool.
+        mempool.write().unwrap().remove(txids_to_remove);
+
+        // 3. Download the new transactions from the daemon's mempool
+        let new_txids: Vec<&Txid> = all_txids.difference(&old_txids).collect();
+        let txs_to_add = daemon
+            .gettransactions(&new_txids)
+            .chain_err(|| format!("failed to get {} transactions", new_txids.len()))?;
+
+        // 4. Update local mempool to match daemon's state
+        {
+            let mut mempool = mempool.write().unwrap();
+            // Add new transactions
+            mempool.add(txs_to_add);
+
+            mempool
+                .count
+                .with_label_values(&["txs"])
+                .set(mempool.txstore.len() as f64);
+
+            // Update cached backlog stats (if expired)
+            if mempool.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
+                mempool.update_backlog_stats();
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
 pub struct BacklogStats {
     pub count: u32,
-    pub vsize: u32,     // in virtual bytes (= weight/4)
+    pub vsize: u64,     // in virtual bytes (= weight/4)
     pub total_fee: u64, // in satoshis
-    pub fee_histogram: Vec<(f32, u32)>,
+    pub fee_histogram: Vec<(f64, u64)>,
 }
 
 impl BacklogStats {

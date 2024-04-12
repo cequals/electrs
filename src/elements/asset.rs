@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use bitcoin::hashes::{hex::FromHex, sha256, Hash};
+use bitcoin::hashes::{sha256, Hash};
 use elements::confidential::{Asset, Value};
 use elements::encode::{deserialize, serialize};
 use elements::secp256k1_zkp::ZERO_TWEAK;
@@ -13,17 +13,20 @@ use crate::elements::registry::{AssetMeta, AssetRegistry};
 use crate::errors::*;
 use crate::new_index::schema::{TxHistoryInfo, TxHistoryKey, TxHistoryRow};
 use crate::new_index::{db::DBFlush, ChainQuery, DBRow, Mempool, Query};
-use crate::util::{full_hash, Bytes, FullHash, TransactionStatus, TxInput};
+use crate::util::{bincode, full_hash, Bytes, FullHash, TransactionStatus, TxInput};
 
 lazy_static! {
     pub static ref NATIVE_ASSET_ID: AssetId =
-        AssetId::from_hex("6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d")
+        "6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d"
+            .parse()
             .unwrap();
     pub static ref NATIVE_ASSET_ID_TESTNET: AssetId =
-        AssetId::from_hex("144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49")
+        "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49"
+            .parse()
             .unwrap();
     pub static ref NATIVE_ASSET_ID_REGTEST: AssetId =
-        AssetId::from_hex("5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225")
+        "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225"
+            .parse()
             .unwrap();
 }
 
@@ -92,7 +95,7 @@ impl IssuedAsset {
         let reissuance_token = parse_asset_id(&asset.reissuance_token);
 
         let contract_hash = if issuance.asset_entropy != [0u8; 32] {
-            Some(ContractHash::from_inner(issuance.asset_entropy))
+            Some(ContractHash::from_byte_array(issuance.asset_entropy))
         } else {
             None
         };
@@ -189,7 +192,7 @@ pub fn index_confirmed_tx_assets(
     // reissuances are only kept under the history index.
     rows.extend(issuances.into_iter().map(|(asset_id, asset_row)| DBRow {
         key: [b"i", &asset_id.into_inner()[..]].concat(),
-        value: bincode::serialize(&asset_row).unwrap(),
+        value: bincode::serialize_little(&asset_row).unwrap(),
     }));
 }
 
@@ -271,7 +274,7 @@ fn index_tx_assets(
     for (txi_index, txi) in tx.input.iter().enumerate() {
         if let Some(pegin) = get_pegin_data(txi, network) {
             history.push((
-                pegin.asset.explicit().unwrap(),
+                pegin.asset,
                 TxHistoryInfo::Pegin(PeginInfo {
                     txid,
                     vin: txi_index as u16,
@@ -368,7 +371,7 @@ pub fn lookup_asset(
 
     let chain_row = history_db
         .get(&[b"i", &asset_id.into_inner()[..]].concat())
-        .map(|row| bincode::deserialize::<AssetRow>(&row).expect("failed parsing AssetRow"));
+        .map(|row| bincode::deserialize_little::<AssetRow>(&row).expect("failed parsing AssetRow"));
 
     let row = chain_row
         .as_ref()
@@ -392,7 +395,7 @@ pub fn lookup_asset(
 }
 
 pub fn get_issuance_entropy(txin: &TxIn) -> Result<sha256::Midstate> {
-    if !txin.has_issuance {
+    if !txin.has_issuance() {
         bail!("input has no issuance");
     }
 
@@ -446,7 +449,7 @@ where
 {
     DBRow {
         key: asset_cache_key(asset_id),
-        value: bincode::serialize(&(stats, blockhash)).unwrap(),
+        value: bincode::serialize_little(&(stats, blockhash)).unwrap(),
     }
 }
 
@@ -489,7 +492,7 @@ where
         .store()
         .cache_db()
         .get(&asset_cache_key(asset_id))
-        .map(|c| bincode::deserialize(&c).unwrap())
+        .map(|c| bincode::deserialize_little(&c).unwrap())
         .and_then(|(stats, blockhash)| {
             chain
                 .height_by_hash(&blockhash)

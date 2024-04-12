@@ -2,33 +2,33 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64;
-use bitcoin::hashes::hex::{FromHex, ToHex};
-use glob;
-use hex;
+use base64::prelude::{Engine, BASE64_STANDARD};
+use hex::FromHex;
 use itertools::Itertools;
 use serde_json::{from_str, from_value, Value};
 
 #[cfg(not(feature = "liquid"))]
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::{deserialize, serialize_hex};
 #[cfg(feature = "liquid")]
-use elements::encode::{deserialize, serialize};
+use elements::encode::{deserialize, serialize_hex};
 
 use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid};
 use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
 use crate::signal::Waiter;
-use crate::util::HeaderList;
+use crate::util::{HeaderList, DEFAULT_BLOCKHASH};
 
 use crate::errors::*;
 
 fn parse_hash<T>(value: &Value) -> Result<T>
 where
-    T: FromHex,
+    T: FromStr,
+    T::Err: 'static + std::error::Error + Send,
 {
-    Ok(T::from_hex(
+    Ok(T::from_str(
         value
             .as_str()
             .chain_err(|| format!("non-string value: {}", value))?,
@@ -40,7 +40,7 @@ fn header_from_value(value: Value) -> Result<BlockHeader> {
     let header_hex = value
         .as_str()
         .chain_err(|| format!("non-string header: {}", value))?;
-    let header_bytes = hex::decode(header_hex).chain_err(|| "non-hex header")?;
+    let header_bytes = Vec::from_hex(header_hex).chain_err(|| "non-hex header")?;
     Ok(
         deserialize(&header_bytes)
             .chain_err(|| format!("failed to parse header {}", header_hex))?,
@@ -49,13 +49,13 @@ fn header_from_value(value: Value) -> Result<BlockHeader> {
 
 fn block_from_value(value: Value) -> Result<Block> {
     let block_hex = value.as_str().chain_err(|| "non-string block")?;
-    let block_bytes = hex::decode(block_hex).chain_err(|| "non-hex block")?;
+    let block_bytes = Vec::from_hex(block_hex).chain_err(|| "non-hex block")?;
     Ok(deserialize(&block_bytes).chain_err(|| format!("failed to parse block {}", block_hex))?)
 }
 
 fn tx_from_value(value: Value) -> Result<Transaction> {
     let tx_hex = value.as_str().chain_err(|| "non-string tx")?;
-    let tx_bytes = hex::decode(tx_hex).chain_err(|| "non-hex tx")?;
+    let tx_bytes = Vec::from_hex(tx_hex).chain_err(|| "non-hex tx")?;
     Ok(deserialize(&tx_bytes).chain_err(|| format!("failed to parse tx {}", tx_hex))?)
 }
 
@@ -168,7 +168,7 @@ impl Connection {
         let cookie = &self.cookie_getter.get()?;
         let msg = format!(
             "POST / HTTP/1.1\nAuthorization: Basic {}\nContent-Length: {}\n\n{}",
-            base64::encode(cookie),
+            BASE64_STANDARD.encode(cookie),
             request.len(),
             request,
         );
@@ -445,10 +445,7 @@ impl Daemon {
     }
 
     pub fn getblockheader(&self, blockhash: &BlockHash) -> Result<BlockHeader> {
-        header_from_value(self.request(
-            "getblockheader",
-            json!([blockhash.to_hex(), /*verbose=*/ false]),
-        )?)
+        header_from_value(self.request("getblockheader", json!([blockhash, /*verbose=*/ false]))?)
     }
 
     pub fn getblockheaders(&self, heights: &[usize]) -> Result<Vec<BlockHeader>> {
@@ -466,21 +463,20 @@ impl Daemon {
     }
 
     pub fn getblock(&self, blockhash: &BlockHash) -> Result<Block> {
-        let block = block_from_value(
-            self.request("getblock", json!([blockhash.to_hex(), /*verbose=*/ false]))?,
-        )?;
+        let block =
+            block_from_value(self.request("getblock", json!([blockhash, /*verbose=*/ false]))?)?;
         assert_eq!(block.block_hash(), *blockhash);
         Ok(block)
     }
 
     pub fn getblock_raw(&self, blockhash: &BlockHash, verbose: u32) -> Result<Value> {
-        self.request("getblock", json!([blockhash.to_hex(), verbose]))
+        self.request("getblock", json!([blockhash, verbose]))
     }
 
     pub fn getblocks(&self, blockhashes: &[BlockHash]) -> Result<Vec<Block>> {
         let params_list: Vec<Value> = blockhashes
             .iter()
-            .map(|hash| json!([hash.to_hex(), /*verbose=*/ false]))
+            .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
         let values = self.requests("getblock", &params_list)?;
         let mut blocks = vec![];
@@ -493,7 +489,7 @@ impl Daemon {
     pub fn gettransactions(&self, txhashes: &[&Txid]) -> Result<Vec<Transaction>> {
         let params_list: Vec<Value> = txhashes
             .iter()
-            .map(|txhash| json!([txhash.to_hex(), /*verbose=*/ false]))
+            .map(|txhash| json!([txhash, /*verbose=*/ false]))
             .collect();
 
         let values = self.requests("getrawtransaction", &params_list)?;
@@ -511,17 +507,11 @@ impl Daemon {
         blockhash: &BlockHash,
         verbose: bool,
     ) -> Result<Value> {
-        self.request(
-            "getrawtransaction",
-            json!([txid.to_hex(), verbose, blockhash]),
-        )
+        self.request("getrawtransaction", json!([txid, verbose, blockhash]))
     }
 
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
-        let value = self.request(
-            "getrawtransaction",
-            json!([txhash.to_hex(), /*verbose=*/ false]),
-        )?;
+        let value = self.request("getrawtransaction", json!([txhash, /*verbose=*/ false]))?;
         tx_from_value(value)
     }
 
@@ -531,13 +521,13 @@ impl Daemon {
     }
 
     pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-        self.broadcast_raw(&hex::encode(serialize(tx)))
+        self.broadcast_raw(&serialize_hex(tx))
     }
 
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.request("sendrawtransaction", json!([txhex]))?;
         Ok(
-            Txid::from_hex(txid.as_str().chain_err(|| "non-string txid")?)
+            Txid::from_str(txid.as_str().chain_err(|| "non-string txid")?)
                 .chain_err(|| "failed to parse txid")?,
         )
     }
@@ -577,7 +567,7 @@ impl Daemon {
     }
 
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
-        let info: Value = self.request("getblockheader", json!([tip.to_hex()]))?;
+        let info: Value = self.request("getblockheader", json!([tip]))?;
         let tip_height = info
             .get("height")
             .expect("missing height")
@@ -593,7 +583,7 @@ impl Daemon {
             result.append(&mut headers);
         }
 
-        let mut blockhash = BlockHash::default();
+        let mut blockhash = *DEFAULT_BLOCKHASH;
         for header in &result {
             assert_eq!(header.prev_blockhash, blockhash);
             blockhash = header.block_hash();
@@ -619,9 +609,8 @@ impl Daemon {
             bestblockhash,
         );
         let mut new_headers = vec![];
-        let null_hash = BlockHash::default();
         let mut blockhash = *bestblockhash;
-        while blockhash != null_hash {
+        while blockhash != *DEFAULT_BLOCKHASH {
             if indexed_headers.header_by_blockhash(&blockhash).is_some() {
                 break;
             }

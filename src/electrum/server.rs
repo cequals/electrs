@@ -4,29 +4,29 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use error_chain::ChainedError;
-use hex;
+use hex::{self, DisplayHex};
 use serde_json::{from_str, Value};
 
 #[cfg(not(feature = "liquid"))]
-use bitcoin::consensus::encode::serialize;
+use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
-use elements::encode::serialize;
+use elements::encode::serialize_hex;
 
 use crate::chain::Txid;
-use crate::config::Config;
+use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
 use crate::util::{
-    create_socket, full_hash, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry,
-    SyncChannel,
+    create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry, SyncChannel,
 };
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -91,6 +91,14 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
     }
 }
 
+macro_rules! conditionally_log_rpc_event {
+    ($self:ident, $event:expr) => {
+        if $self.rpc_logging.is_some() {
+            $self.log_rpc_event($event);
+        }
+    };
+}
+
 struct Connection {
     query: Arc<Query>,
     last_header_entry: Option<HeaderEntry>,
@@ -102,6 +110,7 @@ struct Connection {
     txs_limit: usize,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
+    rpc_logging: Option<RpcLogging>,
 }
 
 impl Connection {
@@ -112,6 +121,7 @@ impl Connection {
         stats: Arc<Stats>,
         txs_limit: usize,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
+        rpc_logging: Option<RpcLogging>,
     ) -> Connection {
         Connection {
             query,
@@ -124,12 +134,13 @@ impl Connection {
             txs_limit,
             #[cfg(feature = "electrum-discovery")]
             discovery,
+            rpc_logging,
         }
     }
 
     fn blockchain_headers_subscribe(&mut self) -> Result<Value> {
         let entry = self.query.chain().best_header();
-        let hex_header = hex::encode(serialize(entry.header()));
+        let hex_header = serialize_hex(entry.header());
         let result = json!({"hex": hex_header, "height": entry.height()});
         self.last_header_entry = Some(entry);
         Ok(result)
@@ -201,7 +212,7 @@ impl Connection {
             .query
             .chain()
             .header_by_height(height)
-            .map(|entry| hex::encode(&serialize(entry.header())))
+            .map(|entry| serialize_hex(entry.header()))
             .chain_err(|| "missing header")?;
 
         if cp_height == 0 {
@@ -227,7 +238,7 @@ impl Connection {
                 self.query
                     .chain()
                     .header_by_height(height)
-                    .map(|entry| hex::encode(&serialize(entry.header())))
+                    .map(|entry| serialize_hex(entry.header()))
             })
             .collect();
 
@@ -272,7 +283,7 @@ impl Connection {
 
         let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
         let status_hash = get_status_hash(history_txids, &self.query)
-            .map_or(Value::Null, |h| json!(hex::encode(full_hash(&h[..]))));
+            .map_or(Value::Null, |h| json!(h.to_lower_hex_string()));
 
         if let None = self.status_hashes.insert(script_hash, status_hash.clone()) {
             self.stats.subscriptions.inc();
@@ -359,11 +370,11 @@ impl Connection {
             bail!("verbose transactions are currently unsupported");
         }
 
-        let tx = self
+        let rawtx = self
             .query
             .lookup_raw_txn(&tx_hash)
             .chain_err(|| "missing transaction")?;
-        Ok(json!(hex::encode(tx)))
+        Ok(json!(rawtx.to_lower_hex_string()))
     }
 
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
@@ -466,7 +477,7 @@ impl Connection {
             let entry = self.query.chain().best_header();
             if *last_entry != entry {
                 *last_entry = entry;
-                let hex_header = hex::encode(serialize(last_entry.header()));
+                let hex_header = serialize_hex(last_entry.header());
                 let header = json!({"hex": hex_header, "height": last_entry.height()});
                 result.push(json!({
                     "jsonrpc": "2.0",
@@ -477,7 +488,7 @@ impl Connection {
         for (script_hash, status_hash) in self.status_hashes.iter_mut() {
             let history_txids = get_history(&self.query, &script_hash[..], self.txs_limit)?;
             let new_status_hash = get_status_hash(history_txids, &self.query)
-                .map_or(Value::Null, |h| json!(hex::encode(full_hash(&h[..]))));
+                .map_or(Value::Null, |h| json!(h.to_lower_hex_string()));
             if new_status_hash == *status_hash {
                 continue;
             }
@@ -489,6 +500,17 @@ impl Connection {
         }
         timer.observe_duration();
         Ok(result)
+    }
+
+    fn log_rpc_event(&self, mut log: Value) {
+        log.as_object_mut().unwrap().insert(
+            "source".into(),
+            json!({
+                "ip": self.addr.ip().to_string(),
+                "port": self.addr.port(),
+            }),
+        );
+        println!("{}", log);
     }
 
     fn send_values(&mut self, values: &[Value]) -> Result<()> {
@@ -505,11 +527,12 @@ impl Connection {
         let empty_params = json!([]);
         loop {
             let msg = self.chan.receiver().recv().chain_err(|| "channel closed")?;
+            let start_time = Instant::now();
             trace!("RPC {:?}", msg);
             match msg {
                 Message::Request(line) => {
                     let cmd: Value = from_str(&line).chain_err(|| "invalid JSON format")?;
-                    let reply = match (
+                    match (
                         cmd.get("method"),
                         cmd.get("params").unwrap_or_else(|| &empty_params),
                         cmd.get("id"),
@@ -518,10 +541,40 @@ impl Connection {
                             Some(&Value::String(ref method)),
                             &Value::Array(ref params),
                             Some(ref id),
-                        ) => self.handle_command(method, params, id)?,
-                        _ => bail!("invalid command: {}", cmd),
-                    };
-                    self.send_values(&[reply])?
+                        ) => {
+                            conditionally_log_rpc_event!(
+                                self,
+                                json!({
+                                    "event": "rpc request",
+                                    "id": id,
+                                    "method": method,
+                                    "params": if let Some(RpcLogging::Full) = self.rpc_logging {
+                                        json!(params)
+                                    } else {
+                                        Value::Null
+                                    }
+                                })
+                            );
+
+                            let reply = self.handle_command(method, params, id)?;
+
+                            conditionally_log_rpc_event!(
+                                self,
+                                json!({
+                                    "event": "rpc response",
+                                    "method": method,
+                                    "payload_size": reply.to_string().as_bytes().len(),
+                                    "duration_micros": start_time.elapsed().as_micros(),
+                                    "id": id,
+                                })
+                            );
+
+                            self.send_values(&[reply])?
+                        }
+                        _ => {
+                            bail!("invalid command: {}", cmd)
+                        }
+                    }
                 }
                 Message::PeriodicUpdate => {
                     let values = self
@@ -564,6 +617,8 @@ impl Connection {
 
     pub fn run(mut self) {
         self.stats.clients.inc();
+        conditionally_log_rpc_event!(self, json!({ "event": "connection established" }));
+
         let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
         let tx = self.chan.sender();
         let child = spawn_thread("reader", || Connection::handle_requests(reader, tx));
@@ -580,6 +635,8 @@ impl Connection {
             .sub(self.status_hashes.len() as i64);
 
         debug!("[{}] shutting down connection", self.addr);
+        conditionally_log_rpc_event!(self, json!({ "event": "connection closed" }));
+
         let _ = self.stream.shutdown(Shutdown::Both);
         if let Err(err) = child.join().expect("receiver panicked") {
             error!("[{}] receiver failed: {}", self.addr, err);
@@ -742,6 +799,7 @@ impl RPC {
                     let garbage_sender = garbage_sender.clone();
                     #[cfg(feature = "electrum-discovery")]
                     let discovery = discovery.clone();
+                    let rpc_logging = config.electrum_rpc_logging.clone();
 
                     let spawned = spawn_thread("peer", move || {
                         info!("[{}] connected peer", addr);
@@ -753,6 +811,7 @@ impl RPC {
                             txs_limit,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
+                            rpc_logging,
                         );
                         senders.lock().unwrap().push(conn.chan.sender());
                         conn.run();

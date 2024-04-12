@@ -1,6 +1,6 @@
-use bitcoin::hashes::{hex::ToHex, Hash};
-use elements::secp256k1_zkp::ZERO_TWEAK;
-use elements::{confidential::Value, encode::serialize, issuance::ContractHash, AssetId, TxIn};
+use bitcoin::hashes::{sha256, Hash};
+use elements::secp256k1_zkp::{PedersenCommitment, Tweak, ZERO_TWEAK};
+use elements::{issuance::ContractHash, AssetId, TxIn};
 
 pub mod asset;
 pub mod peg;
@@ -12,21 +12,21 @@ pub use registry::{AssetRegistry, AssetSorting};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IssuanceValue {
-    pub asset_id: String,
+    pub asset_id: AssetId,
     pub is_reissuance: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub asset_blinding_nonce: Option<String>,
+    pub asset_blinding_nonce: Option<Tweak>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub contract_hash: Option<String>,
-    pub asset_entropy: String,
+    pub contract_hash: Option<ContractHash>,
+    pub asset_entropy: sha256::Midstate,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assetamount: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub assetamountcommitment: Option<String>,
+    pub assetamountcommitment: Option<PedersenCommitment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokenamount: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tokenamountcommitment: Option<String>,
+    pub tokenamountcommitment: Option<PedersenCommitment>,
 }
 
 impl From<&TxIn> for IssuanceValue {
@@ -44,33 +44,54 @@ impl From<&TxIn> for IssuanceValue {
         };
 
         IssuanceValue {
-            asset_id: asset_id.to_hex(),
-            asset_entropy: asset_entropy.to_hex(),
-            contract_hash: contract_hash.map(|h| h.to_hex()),
+            asset_id,
+            asset_entropy,
+            contract_hash,
             is_reissuance,
             asset_blinding_nonce: if is_reissuance {
-                Some(hex::encode(issuance.asset_blinding_nonce.as_ref()))
+                Some(issuance.asset_blinding_nonce)
             } else {
                 None
             },
-            assetamount: match issuance.amount {
-                Value::Explicit(value) => Some(value),
-                Value::Null => Some(0),
-                Value::Confidential(..) => None,
-            },
-            assetamountcommitment: match issuance.amount {
-                Value::Confidential(..) => Some(hex::encode(serialize(&issuance.amount))),
-                _ => None,
-            },
-            tokenamount: match issuance.inflation_keys {
-                Value::Explicit(value) => Some(value),
-                Value::Null => Some(0),
-                Value::Confidential(..) => None,
-            },
-            tokenamountcommitment: match issuance.inflation_keys {
-                Value::Confidential(..) => Some(hex::encode(serialize(&issuance.inflation_keys))),
-                _ => None,
-            },
+            assetamount: issuance.amount.explicit(),
+            assetamountcommitment: issuance.amount.commitment(),
+            tokenamount: issuance.inflation_keys.explicit(),
+            tokenamountcommitment: issuance.inflation_keys.commitment(),
+        }
+    }
+}
+
+// Traits to make rust-elements' types compatible with the changes made in rust-bitcoin v0.31
+// Should hopefully eventually make its way into rust-elements itself.
+pub mod ebcompact {
+    pub trait SizeMethod {
+        fn total_size(&self) -> usize;
+    }
+    impl SizeMethod for elements::Block {
+        fn total_size(&self) -> usize {
+            self.size()
+        }
+    }
+    impl SizeMethod for elements::Transaction {
+        fn total_size(&self) -> usize {
+            self.size()
+        }
+    }
+
+    pub trait ScriptMethods {
+        fn is_p2wpkh(&self) -> bool;
+        fn is_p2wsh(&self) -> bool;
+        fn is_p2tr(&self) -> bool;
+    }
+    impl ScriptMethods for elements::Script {
+        fn is_p2wpkh(&self) -> bool {
+            self.is_v0_p2wpkh()
+        }
+        fn is_p2wsh(&self) -> bool {
+            self.is_v0_p2wsh()
+        }
+        fn is_p2tr(&self) -> bool {
+            self.is_v1_p2tr()
         }
     }
 }

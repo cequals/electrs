@@ -495,6 +495,7 @@ async fn run_server(config: Arc<Config>, query: Arc<Query>, rx: oneshot::Receive
                 let config = Arc::clone(&config);
 
                 async move {
+                    info!("{:?}", req);
                     let method = req.method().clone();
                     let uri = req.uri().clone();
                     let body = hyper::body::to_bytes(req.into_body()).await?;

@@ -589,6 +589,8 @@ fn handle_request(
     query: &Query,
     config: &Config,
 ) -> Result<Response<Body>, HttpError> {
+    info!("uri {:?}", uri);
+
     // TODO it looks hyper does not have routing and query parsing :(
     let path: Vec<&str> = uri.path().split('/').skip(1).collect();
     let query_params = match uri.query() {

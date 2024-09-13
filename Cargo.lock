@@ -655,7 +655,7 @@ dependencies = [
  "sysconf",
  "tempfile",
  "tikv-jemallocator",
- "time 0.3.9",
+ "time 0.3.34",
  "tiny_http",
  "tokio",
  "ureq 2.9.5",
@@ -2409,7 +2409,6 @@ name = "tokio"
 version = "1.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61285f6515fa018fb2d1e46eb21223fff441ee8db5d0f1435e8ab4f5cdb80931"
-
 dependencies = [
  "backtrace",
  "libc",

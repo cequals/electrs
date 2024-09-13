@@ -41,6 +41,7 @@ pub struct Config {
     pub electrum_txs_limit: usize,
     pub electrum_banner: String,
     pub electrum_rpc_logging: Option<RpcLogging>,
+    pub read_only: bool,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
@@ -197,6 +198,10 @@ impl Config {
                     .long("electrum-rpc-logging")
                     .help(&rpc_logging_help)
                     .takes_value(true),
+            ).arg(
+                Arg::with_name("read_only")
+                    .long("readonly")
+                    .help("Enable readonly mode. This will prevent this server from updating the index tables.")
             );
 
         #[cfg(unix)]
@@ -404,6 +409,7 @@ impl Config {
             electrum_rpc_logging: m
                 .value_of("electrum_rpc_logging")
                 .map(|option| RpcLogging::from(option)),
+            read_only: m.is_present("read_only"),
             http_addr,
             http_socket_file,
             monitoring_addr,

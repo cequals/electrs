@@ -72,6 +72,7 @@ impl<'a> Iterator for ReverseScanIterator<'a> {
 #[derive(Debug)]
 pub struct DB {
     db: rocksdb::DB,
+    read_only_mode: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -84,7 +85,7 @@ impl DB {
     pub fn open(path: &Path, config: &Config) -> DB {
         debug!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
-        db_opts.create_if_missing(true);
+        db_opts.create_if_missing(!config.read_only);
         db_opts.set_max_open_files(100_000); // TODO: make sure to `ulimit -n` this process correctly
         db_opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
         db_opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
@@ -99,14 +100,26 @@ impl DB {
         // let mut block_opts = rocksdb::BlockBasedOptions::default();
         // block_opts.set_block_size(???);
 
+        let db = if config.read_only {
+            rocksdb::DB::open_for_read_only(&db_opts, path, false)
+                .expect("failed to open RocksDB in read-only mode")
+        } else {
+            rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB")
+        };
+
         let db = DB {
-            db: rocksdb::DB::open(&db_opts, path).expect("failed to open RocksDB"),
+            db,
+            read_only_mode: config.read_only,
         };
         db.verify_compatibility(config);
         db
     }
 
     pub fn full_compaction(&self) {
+        if self.read_only_mode {
+            return;
+        }
+
         // TODO: make sure this doesn't fail silently
         debug!("starting full compaction on {:?}", self.db);
         self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
@@ -114,6 +127,10 @@ impl DB {
     }
 
     pub fn enable_auto_compaction(&self) {
+        if self.read_only_mode {
+            return;
+        }
+
         let opts = [("disable_auto_compactions", "false")];
         self.db.set_options(&opts).unwrap();
     }
@@ -154,6 +171,10 @@ impl DB {
     }
 
     pub fn write(&self, mut rows: Vec<DBRow>, flush: DBFlush) {
+        if self.read_only_mode {
+            return;
+        }
+
         debug!(
             "writing {} rows to {:?}, flush={:?}",
             rows.len(),
@@ -179,14 +200,26 @@ impl DB {
     }
 
     pub fn flush(&self) {
+        if self.read_only_mode {
+            return;
+        }
+
         self.db.flush().unwrap();
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
+        if self.read_only_mode {
+            return;
+        }
+
         self.db.put(key, value).unwrap();
     }
 
     pub fn put_sync(&self, key: &[u8], value: &[u8]) {
+        if self.read_only_mode {
+            return;
+        }
+
         let mut opts = rocksdb::WriteOptions::new();
         opts.set_sync(true);
         self.db.put_opt(key, value, &opts).unwrap();

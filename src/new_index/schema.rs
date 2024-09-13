@@ -308,6 +308,7 @@ impl Indexer {
 
     fn add(&self, blocks: &[BlockEntry]) {
         // TODO: skip orphaned blocks?
+
         let rows = {
             let _timer = self.start_timer("add_process");
             add_blocks(blocks, &self.iconfig)

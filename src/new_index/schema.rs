@@ -17,10 +17,6 @@ use elements::{
     AssetId,
 };
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Arc, RwLock};
-
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
 };
@@ -32,12 +28,17 @@ use crate::util::{
     bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
 use crate::elements::{asset, peg};
+use crate::signal::Waiter;
 
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
@@ -165,6 +166,7 @@ pub struct Indexer {
     store: Arc<Store>,
     flush: DBFlush,
     from: FetchFrom,
+    signal: Waiter,
     iconfig: IndexerConfig,
     duration: HistogramVec,
     tip_metric: Gauge,
@@ -175,6 +177,7 @@ struct IndexerConfig {
     address_search: bool,
     index_unspendables: bool,
     network: Network,
+    read_only_mode: bool,
     #[cfg(feature = "liquid")]
     parent_network: crate::chain::BNetwork,
 }
@@ -186,6 +189,7 @@ impl From<&Config> for IndexerConfig {
             address_search: config.address_search,
             index_unspendables: config.index_unspendables,
             network: config.network_type,
+            read_only_mode: config.read_only,
             #[cfg(feature = "liquid")]
             parent_network: config.parent_network,
         }
@@ -207,6 +211,7 @@ impl Indexer {
             store,
             flush: DBFlush::Disable,
             from,
+            signal: Waiter::start(),
             iconfig: IndexerConfig::from(config),
             duration: metrics.histogram_vec(
                 HistogramOpts::new("index_duration", "Index update duration (in seconds)"),
@@ -265,6 +270,7 @@ impl Indexer {
         let new_headers = self.get_new_headers(&daemon, &tip)?;
 
         let to_add = self.headers_to_add(&new_headers);
+
         debug!(
             "adding transactions from {} blocks using {:?}",
             to_add.len(),
@@ -328,7 +334,11 @@ impl Indexer {
     fn index(&self, blocks: &[BlockEntry]) {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
+            lookup_txos(
+                &self.store.txstore_db,
+                &get_previous_txos(blocks),
+                self.iconfig.read_only_mode,
+            )
         };
         let rows = {
             let _timer = self.start_timer("index_process");
@@ -336,7 +346,7 @@ impl Indexer {
             for b in blocks {
                 let blockhash = b.entry.hash();
                 // TODO: replace by lookup into txstore_db?
-                if !added_blockhashes.contains(blockhash) {
+                if !added_blockhashes.contains(blockhash) && !self.iconfig.read_only_mode {
                     panic!("cannot index block {} (missing from store)", blockhash);
                 }
             }

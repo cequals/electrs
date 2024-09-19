@@ -1,9 +1,10 @@
 use rocksdb;
 
-use std::path::Path;
-
 use crate::config::Config;
 use crate::util::{bincode, Bytes};
+use derivative::Derivative;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 static DB_VERSION: u32 = 1;
 
@@ -69,10 +70,15 @@ impl<'a> Iterator for ReverseScanIterator<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct DB {
     db: rocksdb::DB,
     read_only_mode: bool,
+    path: PathBuf,
+    #[derivative(Debug = "ignore")]
+    db_opts: Arc<rocksdb::Options>,
+    config: Config,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -84,21 +90,7 @@ pub enum DBFlush {
 impl DB {
     pub fn open(path: &Path, config: &Config) -> DB {
         debug!("opening DB at {:?}", path);
-        let mut db_opts = rocksdb::Options::default();
-        db_opts.create_if_missing(!config.read_only);
-        db_opts.set_max_open_files(100_000); // TODO: make sure to `ulimit -n` this process correctly
-        db_opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
-        db_opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
-        db_opts.set_target_file_size_base(1_073_741_824);
-        db_opts.set_write_buffer_size(256 << 20);
-        db_opts.set_disable_auto_compactions(true); // for initial bulk load
-
-        // db_opts.set_advise_random_on_open(???);
-        db_opts.set_compaction_readahead_size(1 << 20);
-        db_opts.increase_parallelism(2);
-
-        // let mut block_opts = rocksdb::BlockBasedOptions::default();
-        // block_opts.set_block_size(???);
+        let db_opts = Arc::new(build_db_options(config));
 
         let db = if config.read_only {
             rocksdb::DB::open_for_read_only(&db_opts, path, false)
@@ -110,9 +102,25 @@ impl DB {
         let db = DB {
             db,
             read_only_mode: config.read_only,
+            path: path.to_path_buf(),
+            db_opts: db_opts.clone(),
+            config: config.clone(), // Ensure Config implements Clone
         };
         db.verify_compatibility(config);
         db
+    }
+
+    pub fn reopen(&mut self) {
+        // Re-open the database to reload the latest data from disk and drop any cached data.
+        self.db = if self.read_only_mode {
+            rocksdb::DB::open_for_read_only(&self.db_opts, &self.path, false)
+                .expect("failed to open RocksDB in read-only mode")
+        } else {
+            rocksdb::DB::open(&self.db_opts, &self.path).expect("failed to open RocksDB")
+        };
+
+        // Just to be safe, verify that the database is still compatible
+        self.verify_compatibility(&self.config);
     }
 
     pub fn full_compaction(&self) {
@@ -248,4 +256,18 @@ impl DB {
             Some(_) => (),
         }
     }
+}
+
+fn build_db_options(config: &Config) -> rocksdb::Options {
+    let mut db_opts = rocksdb::Options::default();
+    db_opts.create_if_missing(!config.read_only);
+    db_opts.set_max_open_files(100_000);
+    db_opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
+    db_opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
+    db_opts.set_target_file_size_base(1_073_741_824);
+    db_opts.set_write_buffer_size(256 << 20);
+    db_opts.set_disable_auto_compactions(true);
+    db_opts.set_compaction_readahead_size(1 << 20);
+    db_opts.increase_parallelism(2);
+    db_opts
 }

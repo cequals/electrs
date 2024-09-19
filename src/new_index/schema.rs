@@ -24,6 +24,8 @@ use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
+use crate::new_index::db::{DBFlush, DBRow, DB};
+use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 use crate::util::{
     bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
@@ -33,9 +35,6 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
-use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
-
 #[cfg(feature = "liquid")]
 use crate::elements::{asset, peg};
 use crate::signal::Waiter;
@@ -44,9 +43,9 @@ const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
 pub struct Store {
     // TODO: should be column families
-    txstore_db: DB,
-    history_db: DB,
-    cache_db: DB,
+    txstore_db: RwLock<DB>,
+    history_db: RwLock<DB>,
+    cache_db: RwLock<DB>,
     added_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_headers: RwLock<HeaderList>,
@@ -54,17 +53,17 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path, config: &Config) -> Self {
-        let txstore_db = DB::open(&path.join("txstore"), config);
+        let txstore_db = RwLock::new(DB::open(&path.join("txstore"), config));
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config);
+        let history_db = RwLock::new(DB::open(&path.join("history"), config));
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config);
+        let cache_db = RwLock::new(DB::open(&path.join("cache"), config));
 
-        let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
+        let headers = if let Some(tip_hash) = txstore_db.read().unwrap().get(b"t") {
             let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
             let headers_map = load_blockheaders(&txstore_db);
             debug!(
@@ -87,20 +86,58 @@ impl Store {
         }
     }
 
-    pub fn txstore_db(&self) -> &DB {
+    pub fn reopen(&self) {
+        // Reopen each database
+        self.txstore_db.write().unwrap().reopen();
+        self.history_db.write().unwrap().reopen();
+        self.cache_db.write().unwrap().reopen();
+
+        // Reload added_blockhashes
+        let added_blockhashes = load_blockhashes(&self.txstore_db, &BlockRow::done_filter());
+        *self.added_blockhashes.write().unwrap() = added_blockhashes;
+        debug!(
+            "{} blocks were added after reopen",
+            self.added_blockhashes.read().unwrap().len()
+        );
+
+        // Reload indexed_blockhashes
+        let indexed_blockhashes = load_blockhashes(&self.history_db, &BlockRow::done_filter());
+        *self.indexed_blockhashes.write().unwrap() = indexed_blockhashes;
+        debug!(
+            "{} blocks were indexed after reopen",
+            self.indexed_blockhashes.read().unwrap().len()
+        );
+
+        // Reload headers
+        let headers = if let Some(tip_hash) = self.txstore_db.read().unwrap().get(b"t") {
+            let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
+            let headers_map = load_blockheaders(&self.txstore_db);
+            debug!(
+                "{} headers were loaded after reopen, tip at {:?}",
+                headers_map.len(),
+                tip_hash
+            );
+            HeaderList::new(headers_map, tip_hash)
+        } else {
+            HeaderList::empty()
+        };
+        *self.indexed_headers.write().unwrap() = headers;
+    }
+
+    pub fn txstore_db(&self) -> &RwLock<DB> {
         &self.txstore_db
     }
 
-    pub fn history_db(&self) -> &DB {
+    pub fn history_db(&self) -> &RwLock<DB> {
         &self.history_db
     }
 
-    pub fn cache_db(&self) -> &DB {
+    pub fn cache_db(&self) -> &RwLock<DB> {
         &self.cache_db
     }
 
     pub fn done_initial_sync(&self) -> bool {
-        self.txstore_db.get(b"t").is_some()
+        self.txstore_db.read().unwrap().get(b"t").is_some()
     }
 }
 
@@ -206,12 +243,18 @@ pub struct ChainQuery {
 
 // TODO: &[Block] should be an iterator / a queue.
 impl Indexer {
-    pub fn open(store: Arc<Store>, from: FetchFrom, config: &Config, metrics: &Metrics) -> Self {
+    pub fn open(
+        store: Arc<Store>,
+        from: FetchFrom,
+        signal: Waiter,
+        config: &Config,
+        metrics: &Metrics,
+    ) -> Self {
         Indexer {
             store,
             flush: DBFlush::Disable,
             from,
-            signal: Waiter::start(),
+            signal,
             iconfig: IndexerConfig::from(config),
             duration: metrics.histogram_vec(
                 HistogramOpts::new("index_duration", "Index update duration (in seconds)"),
@@ -243,14 +286,14 @@ impl Indexer {
             .collect()
     }
 
-    fn start_auto_compactions(&self, db: &DB) {
+    fn start_auto_compactions(&self, db: &RwLock<DB>) {
         let key = b"F".to_vec();
-        if db.get(&key).is_none() {
-            db.full_compaction();
-            db.put_sync(&key, b"");
-            assert!(db.get(&key).is_some());
+        if db.read().unwrap().get(&key).is_none() {
+            db.write().unwrap().full_compaction();
+            db.write().unwrap().put_sync(&key, b"");
+            assert!(db.read().unwrap().get(&key).is_some());
         }
-        db.enable_auto_compaction();
+        db.write().unwrap().enable_auto_compaction();
     }
 
     fn get_new_headers(&self, daemon: &Daemon, tip: &BlockHash) -> Result<Vec<HeaderEntry>> {
@@ -268,6 +311,14 @@ impl Indexer {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
         let new_headers = self.get_new_headers(&daemon, &tip)?;
+
+        // Re-open databases if in read-only mode in order to invalidate the cache
+        if self.iconfig.read_only_mode {
+            info!("reader instance: pausing process to allow writer instance to flush tables' updates to disk.");
+            self.signal.wait(Duration::from_secs(60), false)?;
+            info!("reader instance: re-opening databases in store due to read-only mode.");
+            self.store.reopen();
+        }
 
         let to_add = self.headers_to_add(&new_headers);
 
@@ -290,14 +341,18 @@ impl Indexer {
 
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");
-            self.store.txstore_db.flush();
-            self.store.history_db.flush();
+            self.store.txstore_db.write().unwrap().flush();
+            self.store.history_db.write().unwrap().flush();
             self.flush = DBFlush::Enable;
         }
 
         // update the synced tip *after* the new data is flushed to disk
         debug!("updating synced tip to {:?}", tip);
-        self.store.txstore_db.put_sync(b"t", &serialize(&tip));
+        self.store
+            .txstore_db
+            .write()
+            .unwrap()
+            .put_sync(b"t", &serialize(&tip));
 
         let mut headers = self.store.indexed_headers.write().unwrap();
         headers.apply(new_headers);
@@ -321,7 +376,11 @@ impl Indexer {
         };
         {
             let _timer = self.start_timer("add_write");
-            self.store.txstore_db.write(rows, self.flush);
+            self.store
+                .txstore_db
+                .write()
+                .unwrap()
+                .write(rows, self.flush);
         }
 
         self.store
@@ -352,7 +411,11 @@ impl Indexer {
             }
             index_blocks(blocks, &previous_txos_map, &self.iconfig)
         };
-        self.store.history_db.write(rows, self.flush);
+        self.store
+            .history_db
+            .write()
+            .unwrap()
+            .write(rows, self.flush);
     }
 
     pub fn fetch_from(&mut self, from: FetchFrom) {
@@ -396,6 +459,8 @@ impl ChainQuery {
         } else {
             self.store
                 .txstore_db
+                .read()
+                .unwrap()
                 .get(&BlockRow::txids_key(full_hash(&hash[..])))
                 .map(|val| bincode::deserialize_little(&val).expect("failed to parse block txids"))
         }
@@ -410,6 +475,8 @@ impl ChainQuery {
         } else {
             self.store
                 .txstore_db
+                .read()
+                .unwrap()
                 .get(&BlockRow::meta_key(full_hash(&hash[..])))
                 .map(|val| bincode::deserialize_little(&val).expect("failed to parse BlockMeta"))
         }
@@ -463,17 +530,22 @@ impl ChainQuery {
         })
     }
 
-    pub fn history_iter_scan(&self, code: u8, hash: &[u8], start_height: usize) -> ScanIterator {
-        self.store.history_db.iter_scan_from(
-            &TxHistoryRow::filter(code, &hash[..]),
-            &TxHistoryRow::prefix_height(code, &hash[..], start_height as u32),
-        )
+    pub fn history_scan(&self, code: u8, hash: &[u8], start_height: usize) -> Vec<DBRow> {
+        let db_guard = self.store.history_db.read().unwrap();
+        let iterator = db_guard.iter_scan_from(
+            &TxHistoryRow::filter(code, hash),
+            &TxHistoryRow::prefix_height(code, hash, start_height as u32),
+        );
+        iterator.collect()
     }
-    fn history_iter_scan_reverse(&self, code: u8, hash: &[u8]) -> ReverseScanIterator {
-        self.store.history_db.iter_scan_reverse(
-            &TxHistoryRow::filter(code, &hash[..]),
-            &TxHistoryRow::prefix_end(code, &hash[..]),
-        )
+
+    pub fn history_scan_reverse(&self, code: u8, hash: &[u8]) -> Vec<DBRow> {
+        let db_guard = self.store.history_db.read().unwrap();
+        let iterator = db_guard.iter_scan_reverse(
+            &TxHistoryRow::filter(code, hash),
+            &TxHistoryRow::prefix_end(code, hash),
+        );
+        iterator.collect()
     }
 
     pub fn history(
@@ -495,7 +567,8 @@ impl ChainQuery {
     ) -> Vec<(Transaction, BlockId)> {
         let _timer_scan = self.start_timer("history");
         let txs_conf = self
-            .history_iter_scan_reverse(code, hash)
+            .history_scan_reverse(code, hash)
+            .into_iter()
             .map(|row| TxHistoryRow::from_row(row).get_txid())
             // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
             .unique()
@@ -527,7 +600,8 @@ impl ChainQuery {
 
     fn _history_txids(&self, code: u8, hash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
         let _timer = self.start_timer("history_txids");
-        self.history_iter_scan(code, hash, 0)
+        self.history_scan(code, hash, 0)
+            .into_iter()
             .map(|row| TxHistoryRow::from_row(row).get_txid())
             .unique()
             .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
@@ -544,6 +618,8 @@ impl ChainQuery {
         let cache: Option<(UtxoMap, usize)> = self
             .store
             .cache_db
+            .read()
+            .unwrap()
             .get(&UtxoCacheRow::key(scripthash))
             .map(|c| bincode::deserialize_little(&c).unwrap())
             .and_then(|(utxos_cache, blockhash)| {
@@ -562,7 +638,7 @@ impl ChainQuery {
         // save updated utxo set to cache
         if let Some(lastblock) = lastblock {
             if had_cache || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
-                self.store.cache_db.write(
+                self.store.cache_db.write().unwrap().write(
                     vec![UtxoCacheRow::new(scripthash, &newutxos, &lastblock).into_row()],
                     DBFlush::Enable,
                 );
@@ -605,7 +681,8 @@ impl ChainQuery {
     ) -> Result<(UtxoMap, Option<BlockHash>, usize)> {
         let _timer = self.start_timer("utxo_delta");
         let history_iter = self
-            .history_iter_scan(b'H', scripthash, start_height)
+            .history_scan(b'H', scripthash, start_height)
+            .into_iter()
             .map(TxHistoryRow::from_row)
             .filter_map(|history| {
                 self.tx_confirming_block(&history.get_txid())
@@ -649,6 +726,8 @@ impl ChainQuery {
         let cache: Option<(ScriptStats, usize)> = self
             .store
             .cache_db
+            .read()
+            .unwrap()
             .get(&StatsCacheRow::key(scripthash))
             .map(|c| bincode::deserialize_little(&c).unwrap())
             .and_then(|(stats, blockhash)| {
@@ -665,7 +744,7 @@ impl ChainQuery {
         // save updated stats to cache
         if let Some(lastblock) = lastblock {
             if newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE {
-                self.store.cache_db.write(
+                self.store.cache_db.write().unwrap().write(
                     vec![StatsCacheRow::new(scripthash, &newstats, &lastblock).into_row()],
                     DBFlush::Enable,
                 );
@@ -683,7 +762,8 @@ impl ChainQuery {
     ) -> (ScriptStats, Option<BlockHash>) {
         let _timer = self.start_timer("stats_delta"); // TODO: measure also the number of txns processed.
         let history_iter = self
-            .history_iter_scan(b'H', scripthash, start_height)
+            .history_scan(b'H', scripthash, start_height)
+            .into_iter()
             .map(TxHistoryRow::from_row)
             .filter_map(|history| {
                 self.tx_confirming_block(&history.get_txid())
@@ -746,6 +826,8 @@ impl ChainQuery {
         let _timer_scan = self.start_timer("address_search");
         self.store
             .history_db
+            .read()
+            .unwrap()
             .iter_scan(&addr_search_filter(prefix))
             .take(limit)
             .map(|row| std::str::from_utf8(&row.key[1..]).unwrap().to_string())
@@ -861,7 +943,11 @@ impl ChainQuery {
             let txhex = txval.as_str().expect("valid tx from bitcoind");
             Some(Bytes::from_hex(txhex).expect("valid tx from bitcoind"))
         } else {
-            self.store.txstore_db.get(&TxRow::key(&txid[..]))
+            self.store
+                .txstore_db
+                .read()
+                .unwrap()
+                .get(&TxRow::key(&txid[..]))
         }
     }
 
@@ -884,6 +970,8 @@ impl ChainQuery {
         let _timer = self.start_timer("lookup_spend");
         self.store
             .history_db
+            .read()
+            .unwrap()
             .iter_scan(&TxEdgeRow::filter(&outpoint))
             .map(TxEdgeRow::from_row)
             .find_map(|edge| {
@@ -900,6 +988,8 @@ impl ChainQuery {
         let headers = self.store.indexed_headers.read().unwrap();
         self.store
             .txstore_db
+            .read()
+            .unwrap()
             .iter_scan(&TxConfRow::filter(&txid[..]))
             .map(TxConfRow::from_row)
             // header_by_blockhash only returns blocks that are part of the best chain,
@@ -961,15 +1051,19 @@ impl ChainQuery {
     }
 }
 
-fn load_blockhashes(db: &DB, prefix: &[u8]) -> HashSet<BlockHash> {
-    db.iter_scan(prefix)
+fn load_blockhashes(db: &RwLock<DB>, prefix: &[u8]) -> HashSet<BlockHash> {
+    db.read()
+        .unwrap()
+        .iter_scan(prefix)
         .map(BlockRow::from_row)
         .map(|r| deserialize(&r.key.hash).expect("failed to parse BlockHash"))
         .collect()
 }
 
-fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
-    db.iter_scan(&BlockRow::header_filter())
+fn load_blockheaders(db: &RwLock<DB>) -> HashMap<BlockHash, BlockHeader> {
+    db.read()
+        .unwrap()
+        .iter_scan(&BlockRow::header_filter())
         .map(BlockRow::from_row)
         .map(|r| {
             let key: BlockHash = deserialize(&r.key.hash).expect("failed to parse BlockHash");
@@ -1045,7 +1139,7 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
 }
 
 fn lookup_txos(
-    txstore_db: &DB,
+    txstore_db: &RwLock<DB>,
     outpoints: &BTreeSet<OutPoint>,
     allow_missing: bool,
 ) -> HashMap<OutPoint, TxOut> {
@@ -1071,8 +1165,10 @@ fn lookup_txos(
     })
 }
 
-fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
+fn lookup_txo(txstore_db: &RwLock<DB>, outpoint: &OutPoint) -> Option<TxOut> {
     txstore_db
+        .read()
+        .unwrap()
         .get(&TxOutRow::key(&outpoint))
         .map(|val| deserialize(&val).expect("failed to parse TxOut"))
 }

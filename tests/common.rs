@@ -121,6 +121,7 @@ impl TestRunner {
             //#[cfg(feature = "electrum-discovery")]
             //tor_proxy: Option<std::net::SocketAddr>,
             tor_proxy: None,
+            read_only: false,
         });
 
         let signal = Waiter::start();
@@ -151,7 +152,7 @@ impl TestRunner {
             FetchFrom::Bitcoind
         };
 
-        let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, &config, &metrics);
+        let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, signal, &config, &metrics);
         indexer.update(&daemon)?;
         indexer.fetch_from(FetchFrom::Bitcoind);
 

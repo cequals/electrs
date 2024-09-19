@@ -36,7 +36,7 @@ fn main() {
             config.cookie_getter(),
             config.network_type,
             config.signet_magic,
-            signal,
+            signal.clone(),
             &metrics,
         )
         .unwrap(),
@@ -44,10 +44,17 @@ fn main() {
 
     let chain = ChainQuery::new(Arc::clone(&store), Arc::clone(&daemon), &config, &metrics);
 
-    let mut indexer = Indexer::open(Arc::clone(&store), FetchFrom::Bitcoind, &config, &metrics);
+    let mut indexer = Indexer::open(
+        Arc::clone(&store),
+        FetchFrom::Bitcoind,
+        signal,
+        &config,
+        &metrics,
+    );
     indexer.update(&daemon).unwrap();
 
-    let mut iter = store.txstore_db().raw_iterator();
+    let db_guard = store.txstore_db().read().unwrap();
+    let mut iter = db_guard.raw_iterator();
     iter.seek(b"T");
 
     let mut total = 0;

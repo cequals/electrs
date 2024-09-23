@@ -11,7 +11,8 @@ fn main() {
     let config = Config::from_args();
     let store = Store::open(&config.db_path.join("newindex"), &config);
 
-    let mut iter = store.history_db().raw_iterator();
+    let db_guard = store.history_db().read().unwrap();
+    let mut iter = db_guard.raw_iterator();
     iter.seek(b"H");
 
     let mut curr_scripthash = [0u8; 32];

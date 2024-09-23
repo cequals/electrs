@@ -365,7 +365,7 @@ pub fn lookup_asset(
         })));
     }
 
-    let history_db = query.chain().store().history_db();
+    let history_db = query.chain().store().history_db().read().unwrap();
     let mempool = query.mempool();
     let mempool_issuances = &mempool.asset_issuance;
 
@@ -491,6 +491,8 @@ where
     let cache: Option<(T, usize)> = chain
         .store()
         .cache_db()
+        .read()
+        .unwrap()
         .get(&asset_cache_key(asset_id))
         .map(|c| bincode::deserialize_little(&c).unwrap())
         .and_then(|(stats, blockhash)| {
@@ -509,7 +511,7 @@ where
 
     // save updated stats to cache
     if let Some(lastblock) = lastblock {
-        chain.store().cache_db().write(
+        chain.store().cache_db().write().unwrap().write(
             vec![asset_cache_row(asset_id, &newstats, &lastblock)],
             DBFlush::Enable,
         );
@@ -527,7 +529,8 @@ fn chain_asset_stats_delta<T>(
     apply_fn: AssetStatApplyFn<T>,
 ) -> (T, Option<BlockHash>) {
     let history_iter = chain
-        .history_iter_scan(b'I', &asset_id.into_inner()[..], start_height)
+        .history_scan(b'I', &asset_id.into_inner()[..], start_height)
+        .into_iter()
         .map(TxHistoryRow::from_row)
         .filter_map(|history| {
             chain

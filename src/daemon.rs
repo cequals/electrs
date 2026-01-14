@@ -1,12 +1,13 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
-use std::env;
+use std::convert::TryFrom;
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{env, fs, io};
 
 use base64::prelude::{Engine, BASE64_STANDARD};
 use error_chain::ChainedError;
@@ -37,6 +38,9 @@ lazy_static! {
         env::var("DAEMON_WRITE_TIMEOUT").map_or(10 * 60, |s| s.parse().unwrap())
     );
 }
+
+const MAX_ATTEMPTS: u32 = 5;
+const RETRY_WAIT_DURATION: Duration = Duration::from_secs(1);
 
 fn parse_hash<T>(value: &Value) -> Result<T>
 where
@@ -394,6 +398,26 @@ impl Daemon {
         Ok(paths)
     }
 
+    /// bitcoind v28.0+ defaults to xor-ing all blk*.dat files with this key,
+    /// stored in the blocks dir.
+    /// See: <https://github.com/bitcoin/bitcoin/pull/28052>
+    pub fn read_blk_file_xor_key(&self) -> Result<Option<[u8; 8]>> {
+        // From: <https://github.com/bitcoin/bitcoin/blob/v28.0/src/node/blockstorage.cpp#L1160>
+        let path = self.blocks_dir.join("xor.dat");
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).chain_err(|| "failed to read daemon xor.dat file"),
+        };
+        let xor_key: [u8; 8] = <[u8; 8]>::try_from(bytes.as_slice()).chain_err(|| {
+            format!(
+                "xor.dat unexpected length: actual: {}, expected: 8",
+                bytes.len()
+            )
+        })?;
+        Ok(Some(xor_key))
+    }
+
     pub fn magic(&self) -> u32 {
         self.magic.unwrap_or_else(|| self.network.magic())
     }
@@ -531,7 +555,28 @@ impl Daemon {
             .iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
-        let values = self.requests("getblock", params_list)?;
+
+        let mut attempts = MAX_ATTEMPTS;
+        let values = loop {
+            attempts -= 1;
+
+            match self.requests("getblock", params_list.clone()) {
+                Ok(blocks) => break blocks,
+                Err(e) => {
+                    let err_msg = format!("{e:?}");
+                    if err_msg.contains("Block not found on disk") {
+                        // There is a small chance the node returns the header but didn't finish to index the block
+                        log::warn!("getblocks failing with: {e:?} trying {attempts} more time")
+                    } else {
+                        panic!("failed to get blocks from bitcoind: {}", err_msg);
+                    }
+                }
+            }
+            if attempts == 0 {
+                panic!("failed to get blocks from bitcoind")
+            }
+            std::thread::sleep(RETRY_WAIT_DURATION);
+        };
         let mut blocks = vec![];
         for value in values {
             blocks.push(block_from_value(value)?);
@@ -600,7 +645,10 @@ impl Daemon {
     // Missing estimates are logged but do not cause a failure, whatever is available is returned
     #[allow(clippy::float_cmp)]
     pub fn estimatesmartfee_batch(&self, conf_targets: &[u16]) -> Result<HashMap<u16, f64>> {
-        let params_list: Vec<Value> = conf_targets.iter().map(|t| json!([t, "ECONOMICAL"])).collect();
+        let params_list: Vec<Value> = conf_targets
+            .iter()
+            .map(|t| json!([t, "ECONOMICAL"]))
+            .collect();
 
         Ok(self
             .requests("estimatesmartfee", params_list)?

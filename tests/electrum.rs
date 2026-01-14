@@ -21,10 +21,13 @@ fn test_electrum() -> Result<()> {
     // Spawn an headless Electrum wallet RPC daemon, connected to Electrs
     let mut electrum_wallet_conf = electrumd::Conf::default();
     let server_arg = format!("{}:t", electrum_addr.to_string());
-    electrum_wallet_conf.args = vec!["-v", "--server", &server_arg];
+    electrum_wallet_conf.args = if std::env::var_os("RUST_LOG").is_some() {
+        vec!["-v", "--server", &server_arg]
+    } else {
+        vec!["--server", &server_arg]
+    };
     electrum_wallet_conf.view_stdout = true;
-    let electrum_wallet =
-        ElectrumD::with_conf(electrumd::downloaded_exe_path()?, &electrum_wallet_conf)?;
+    let electrum_wallet = ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
 
     let notify_wallet = || {
         electrum_server.notify();
@@ -126,7 +129,7 @@ fn test_electrum() -> Result<()> {
         )?]),
     )?;
     notify_wallet();
-    assert_balance(0.3, -0.161);
+    assert_balance(0.139, 0.0);
 
     tester.mine()?;
     notify_wallet();

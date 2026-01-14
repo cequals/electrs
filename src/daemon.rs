@@ -1,4 +1,6 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -7,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::prelude::{Engine, BASE64_STANDARD};
+use error_chain::ChainedError;
 use hex::FromHex;
-use itertools::Itertools;
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde_json::{from_str, from_value, Value};
 
 #[cfg(not(feature = "liquid"))]
@@ -22,6 +25,18 @@ use crate::signal::Waiter;
 use crate::util::{HeaderList, DEFAULT_BLOCKHASH};
 
 use crate::errors::*;
+
+lazy_static! {
+    static ref DAEMON_CONNECTION_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_CONNECTION_TIMEOUT").map_or(10, |s| s.parse().unwrap())
+    );
+    static ref DAEMON_READ_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_READ_TIMEOUT").map_or(10 * 60, |s| s.parse().unwrap())
+    );
+    static ref DAEMON_WRITE_TIMEOUT: Duration = Duration::from_secs(
+        env::var("DAEMON_WRITE_TIMEOUT").map_or(10 * 60, |s| s.parse().unwrap())
+    );
+}
 
 fn parse_hash<T>(value: &Value) -> Result<T>
 where
@@ -66,13 +81,13 @@ fn parse_error_code(err: &Value) -> Option<i64> {
 
 fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Result<Value> {
     if let Some(reply_obj) = reply.as_object_mut() {
-        if let Some(err) = reply_obj.get("error") {
+        if let Some(err) = reply_obj.get_mut("error") {
             if !err.is_null() {
                 if let Some(code) = parse_error_code(&err) {
                     match code {
                         // RPC_IN_WARMUP -> retry by later reconnection
                         -28 => bail!(ErrorKind::Connection(err.to_string())),
-                        _ => bail!("{} RPC error: {}", method, err),
+                        code => bail!(ErrorKind::RpcError(code, err.take(), method.to_string())),
                     }
                 }
             }
@@ -129,10 +144,18 @@ struct Connection {
 
 fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
     loop {
-        match TcpStream::connect(addr) {
-            Ok(conn) => return Ok(conn),
+        match TcpStream::connect_timeout(&addr, *DAEMON_CONNECTION_TIMEOUT) {
+            Ok(conn) => {
+                // can only fail if DAEMON_TIMEOUT is 0
+                conn.set_read_timeout(Some(*DAEMON_READ_TIMEOUT)).unwrap();
+                conn.set_write_timeout(Some(*DAEMON_WRITE_TIMEOUT)).unwrap();
+                return Ok(conn);
+            }
             Err(err) => {
-                warn!("failed to connect daemon at {}: {}", addr, err);
+                warn!(
+                    "failed to connect daemon at {}: {} (backoff 3 seconds)",
+                    addr, err
+                );
                 signal.wait(Duration::from_secs(3), false)?;
                 continue;
             }
@@ -187,7 +210,7 @@ impl Connection {
             .chain_err(|| {
                 ErrorKind::Connection("disconnected from daemon while receiving".to_owned())
             })?
-            .chain_err(|| "failed to read status")?;
+            .chain_err(|| ErrorKind::Connection("failed to read status".to_owned()))?;
         let mut headers = HashMap::new();
         for line in iter {
             let line = line.chain_err(|| ErrorKind::Connection("failed to read".to_owned()))?;
@@ -227,7 +250,7 @@ impl Connection {
         Ok(if status == "HTTP/1.1 200 OK" {
             contents
         } else if status == "HTTP/1.1 500 Internal Server Error" {
-            warn!("HTTP status: {}", status);
+            debug!("RPC HTTP 500 error: {}", contents);
             contents // the contents should have a JSONRPC error field
         } else {
             bail!(
@@ -267,6 +290,8 @@ pub struct Daemon {
     message_id: Counter, // for monotonic JSONRPC 'id'
     signal: Waiter,
 
+    rpc_threads: Arc<rayon::ThreadPool>,
+
     // monitoring
     latency: HistogramVec,
     size: HistogramVec,
@@ -277,6 +302,7 @@ impl Daemon {
         daemon_dir: &PathBuf,
         blocks_dir: &PathBuf,
         daemon_rpc_addr: SocketAddr,
+        daemon_parallelism: usize,
         cookie_getter: Arc<dyn CookieGetter>,
         network: Network,
         magic: Option<u32>,
@@ -295,6 +321,13 @@ impl Daemon {
             )?),
             message_id: Counter::new(),
             signal: signal.clone(),
+            rpc_threads: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(daemon_parallelism)
+                    .thread_name(|i| format!("rpc-requests-{}", i))
+                    .build()
+                    .unwrap(),
+            ),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("daemon_rpc", "Bitcoind RPC latency (in seconds)"),
                 &["method"],
@@ -344,6 +377,7 @@ impl Daemon {
             conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
             message_id: Counter::new(),
             signal: self.signal.clone(),
+            rpc_threads: self.rpc_threads.clone(),
             latency: self.latency.clone(),
             size: self.size.clone(),
         })
@@ -381,33 +415,18 @@ impl Daemon {
         Ok(result)
     }
 
-    fn handle_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    fn handle_request(&self, method: &str, params: &Value) -> Result<Value> {
         let id = self.message_id.next();
-        let chunks = params_list
-            .iter()
-            .map(|params| json!({"method": method, "params": params, "id": id}))
-            .chunks(50_000); // Max Amount of batched requests
-        let mut results = vec![];
-        for chunk in &chunks {
-            let reqs = chunk.collect();
-            let mut replies = self.call_jsonrpc(method, &reqs)?;
-            if let Some(replies_vec) = replies.as_array_mut() {
-                for reply in replies_vec {
-                    results.push(parse_jsonrpc_reply(reply.take(), method, id)?)
-                }
-            } else {
-                bail!("non-array replies: {:?}", replies);
-            }
-        }
-
-        Ok(results)
+        let req = json!({"method": method, "params": params, "id": id});
+        let reply = self.call_jsonrpc(method, &req)?;
+        parse_jsonrpc_reply(reply, method, id)
     }
 
-    fn retry_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    fn retry_request(&self, method: &str, params: &Value) -> Result<Value> {
         loop {
-            match self.handle_request_batch(method, params_list) {
-                Err(Error(ErrorKind::Connection(msg), _)) => {
-                    warn!("reconnecting to bitcoind: {}", msg);
+            match self.handle_request(method, &params) {
+                Err(e @ Error(ErrorKind::Connection(_), _)) => {
+                    warn!("reconnecting to bitcoind: {}", e.display_chain());
                     self.signal.wait(Duration::from_secs(3), false)?;
                     let mut conn = self.conn.lock().unwrap();
                     *conn = conn.reconnect()?;
@@ -419,13 +438,47 @@ impl Daemon {
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let mut values = self.retry_request_batch(method, &[params])?;
-        assert_eq!(values.len(), 1);
-        Ok(values.remove(0))
+        self.retry_request(method, &params)
     }
 
-    fn requests(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
-        self.retry_request_batch(method, params_list)
+    fn retry_reconnect(&self) -> Daemon {
+        // XXX add a max reconnection attempts limit?
+        loop {
+            match self.reconnect() {
+                Ok(daemon) => break daemon,
+                Err(e) => {
+                    warn!("failed connecting to RPC daemon: {}", e.display_chain());
+                }
+            }
+        }
+    }
+
+    // Send requests in parallel over multiple RPC connections as individual JSON-RPC requests (with no JSON-RPC batching),
+    // buffering the replies into a vector. If any of the requests fail, processing is terminated and an Err is returned.
+    fn requests(&self, method: &str, params_list: Vec<Value>) -> Result<Vec<Value>> {
+        self.requests_iter(method, params_list).collect()
+    }
+
+    // Send requests in parallel over multiple RPC connections, iterating over the results without buffering them.
+    // Errors are included in the iterator and do not terminate other pending requests.
+    fn requests_iter<'a>(
+        &'a self,
+        method: &'a str,
+        params_list: Vec<Value>,
+    ) -> impl ParallelIterator<Item = Result<Value>> + IndexedParallelIterator + 'a {
+        self.rpc_threads.install(move || {
+            params_list.into_par_iter().map(move |params| {
+                // Store a local per-thread Daemon, each with its own TCP connection. These will
+                // get initialized as necessary for the `rpc_threads` pool thread managed by rayon.
+                thread_local!(static DAEMON_INSTANCE: OnceCell<Daemon> = OnceCell::new());
+
+                DAEMON_INSTANCE.with(|daemon| {
+                    daemon
+                        .get_or_init(|| self.retry_reconnect())
+                        .retry_request(&method, &params)
+                })
+            })
+        })
     }
 
     // bitcoind JSONRPC API:
@@ -451,12 +504,12 @@ impl Daemon {
     pub fn getblockheaders(&self, heights: &[usize]) -> Result<Vec<BlockHeader>> {
         let heights: Vec<Value> = heights.iter().map(|height| json!([height])).collect();
         let params_list: Vec<Value> = self
-            .requests("getblockhash", &heights)?
+            .requests("getblockhash", heights)?
             .into_iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
         let mut result = vec![];
-        for h in self.requests("getblockheader", &params_list)? {
+        for h in self.requests("getblockheader", params_list)? {
             result.push(header_from_value(h)?);
         }
         Ok(result)
@@ -478,7 +531,7 @@ impl Daemon {
             .iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
-        let values = self.requests("getblock", &params_list)?;
+        let values = self.requests("getblock", params_list)?;
         let mut blocks = vec![];
         for value in values {
             blocks.push(block_from_value(value)?);
@@ -486,19 +539,30 @@ impl Daemon {
         Ok(blocks)
     }
 
-    pub fn gettransactions(&self, txhashes: &[&Txid]) -> Result<Vec<Transaction>> {
-        let params_list: Vec<Value> = txhashes
+    /// Fetch the given transactions in parallel over multiple threads and RPC connections,
+    /// ignoring any missing ones and returning whatever is available.
+    pub fn gettransactions_available(&self, txids: &[&Txid]) -> Result<Vec<(Txid, Transaction)>> {
+        const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
+
+        let params_list: Vec<Value> = txids
             .iter()
             .map(|txhash| json!([txhash, /*verbose=*/ false]))
             .collect();
 
-        let values = self.requests("getrawtransaction", &params_list)?;
-        let mut txs = vec![];
-        for value in values {
-            txs.push(tx_from_value(value)?);
-        }
-        assert_eq!(txhashes.len(), txs.len());
-        Ok(txs)
+        self.requests_iter("getrawtransaction", params_list)
+            .zip(txids)
+            .filter_map(|(res, txid)| match res {
+                Ok(val) => Some(tx_from_value(val).map(|tx| (**txid, tx))),
+                // Ignore 'tx not found' errors
+                Err(Error(ErrorKind::RpcError(code, _, _), _))
+                    if code == RPC_INVALID_ADDRESS_OR_KEY =>
+                {
+                    None
+                }
+                // Terminate iteration if any other errors are encountered
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
     }
 
     pub fn gettransaction_raw(
@@ -536,10 +600,10 @@ impl Daemon {
     // Missing estimates are logged but do not cause a failure, whatever is available is returned
     #[allow(clippy::float_cmp)]
     pub fn estimatesmartfee_batch(&self, conf_targets: &[u16]) -> Result<HashMap<u16, f64>> {
-        let params_list: Vec<Value> = conf_targets.iter().map(|t| json!([t])).collect();
+        let params_list: Vec<Value> = conf_targets.iter().map(|t| json!([t, "ECONOMICAL"])).collect();
 
         Ok(self
-            .requests("estimatesmartfee", &params_list)?
+            .requests("estimatesmartfee", params_list)?
             .iter()
             .zip(conf_targets)
             .filter_map(|(reply, target)| {

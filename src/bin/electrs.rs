@@ -27,6 +27,7 @@ use electrs::{
 
 #[cfg(feature = "liquid")]
 use electrs::elements::AssetRegistry;
+use electrs::metrics::MetricOpts;
 
 fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
     let mut jsonrpc_import = config.jsonrpc_import;
@@ -53,6 +54,7 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         &config.daemon_dir,
         &config.blocks_dir,
         config.daemon_rpc_addr,
+        config.daemon_parallelism,
         config.cookie_getter(),
         config.network_type,
         config.signet_magic,
@@ -86,17 +88,11 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         &metrics,
         Arc::clone(&config),
     )));
-    loop {
-        match Mempool::update(&mempool, &daemon) {
-            Ok(_) => break,
-            Err(e) => {
-                warn!(
-                    "Error performing initial mempool update, trying again in 5 seconds: {}",
-                    e.display_chain()
-                );
-                signal.wait(Duration::from_secs(5), false)?;
-            }
-        }
+
+    while !Mempool::update(&mempool, &daemon, &tip)? {
+        // Mempool syncing was aborted because the chain tip moved;
+        // Index the new block(s) and try again.
+        tip = indexer.update(&daemon)?;
     }
 
     #[cfg(feature = "liquid")]
@@ -119,7 +115,14 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     let rest_server = rest::start(Arc::clone(&config), Arc::clone(&query));
     let electrum_server = ElectrumRPC::start(Arc::clone(&config), Arc::clone(&query), &metrics);
 
+    let main_loop_count = metrics.gauge(MetricOpts::new(
+        "electrs_main_loop_count",
+        "count of iterations of electrs main loop each 5 seconds or after interrupts",
+    ));
+
     loop {
+        main_loop_count.inc();
+
         if let Err(err) = signal.wait(Duration::from_secs(5), true) {
             info!("stopping server: {}", err);
             rest_server.stop();
@@ -130,17 +133,12 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         // Index new blocks
         let current_tip = daemon.getbestblockhash()?;
         if current_tip != tip {
-            indexer.update(&daemon)?;
-            tip = current_tip;
+            tip = indexer.update(&daemon)?;
         };
 
         // Update mempool
-        if let Err(e) = Mempool::update(&mempool, &daemon) {
-            // Log the error if the result is an Err
-            warn!(
-                "Error updating mempool, skipping mempool update: {}",
-                e.display_chain()
-            );
+        if !Mempool::update(&mempool, &daemon, &tip)? {
+            warn!("skipped failed mempool update, trying again in 5 seconds");
         }
 
         // Update subscribed clients

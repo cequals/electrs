@@ -71,10 +71,11 @@ impl Query {
 
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
-        self.mempool
+        let _ = self
+            .mempool
             .write()
             .unwrap()
-            .add_by_txid(&self.daemon, &txid);
+            .add_by_txid(&self.daemon, txid);
         Ok(txid)
     }
 
@@ -118,7 +119,7 @@ impl Query {
             .or_else(|| self.mempool().lookup_raw_txn(txid))
     }
 
-    pub fn lookup_txos(&self, outpoints: &BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
+    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
         // the mempool lookup_txos() internally looks up confirmed txos as well
         self.mempool()
             .lookup_txos(outpoints)

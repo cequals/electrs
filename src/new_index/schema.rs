@@ -327,7 +327,7 @@ impl Indexer {
     fn index(&self, blocks: &[BlockEntry]) {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
+            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
         };
         let rows = {
             let _timer = self.start_timer("index_process");
@@ -859,14 +859,9 @@ impl ChainQuery {
         lookup_txo(&self.store.txstore_db, outpoint)
     }
 
-    pub fn lookup_txos(&self, outpoints: &BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
+    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self.start_timer("lookup_txos");
-        lookup_txos(&self.store.txstore_db, outpoints, false)
-    }
-
-    pub fn lookup_avail_txos(&self, outpoints: &BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
-        let _timer = self.start_timer("lookup_available_txos");
-        lookup_txos(&self.store.txstore_db, outpoints, true)
+        lookup_txos(&self.store.txstore_db, outpoints)
     }
 
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
@@ -983,8 +978,8 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
             let mut rows = vec![];
             let blockhash = full_hash(&b.entry.hash()[..]);
             let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.txid()).collect();
-            for tx in &b.block.txdata {
-                add_transaction(tx, blockhash, &mut rows, iconfig);
+            for (tx, txid) in b.block.txdata.iter().zip(txids.iter()) {
+                add_transaction(*txid, tx, blockhash, &mut rows, iconfig);
             }
 
             if !iconfig.light_mode {
@@ -1001,18 +996,19 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
 }
 
 fn add_transaction(
+    txid: Txid,
     tx: &Transaction,
     blockhash: FullHash,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
 ) {
-    rows.push(TxConfRow::new(tx, blockhash).into_row());
+    rows.push(TxConfRow::new(txid, blockhash).into_row());
 
     if !iconfig.light_mode {
-        rows.push(TxRow::new(tx).into_row());
+        rows.push(TxRow::new(txid, tx).into_row());
     }
 
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&txid[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) {
             rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
@@ -1033,31 +1029,19 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
         .collect()
 }
 
-fn lookup_txos(
-    txstore_db: &DB,
-    outpoints: &BTreeSet<OutPoint>,
-    allow_missing: bool,
-) -> HashMap<OutPoint, TxOut> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(16) // we need to saturate SSD IOPS
-        .thread_name(|i| format!("lookup-txo-{}", i))
-        .build()
-        .unwrap();
-    pool.install(|| {
-        outpoints
-            .par_iter()
-            .filter_map(|outpoint| {
-                lookup_txo(&txstore_db, &outpoint)
-                    .or_else(|| {
-                        if !allow_missing {
-                            panic!("missing txo {} in {:?}", outpoint, txstore_db);
-                        }
-                        None
-                    })
-                    .map(|txo| (*outpoint, txo))
-            })
-            .collect()
-    })
+fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+    let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
+    txstore_db
+        .multi_get(keys)
+        .into_iter()
+        .zip(outpoints)
+        .map(|(res, outpoint)| {
+            let txo = res
+                .unwrap()
+                .ok_or_else(|| format!("missing txo {}", outpoint))?;
+            Ok((outpoint, deserialize(&txo).expect("failed to parse TxOut")))
+        })
+        .collect()
 }
 
 fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
@@ -1199,8 +1183,8 @@ struct TxRow {
 }
 
 impl TxRow {
-    fn new(txn: &Transaction) -> TxRow {
-        let txid = full_hash(&txn.txid()[..]);
+    fn new(txid: Txid, txn: &Transaction) -> TxRow {
+        let txid = full_hash(&txid[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
             value: serialize(txn),
@@ -1232,8 +1216,8 @@ struct TxConfRow {
 }
 
 impl TxConfRow {
-    fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
-        let txid = full_hash(&txn.txid()[..]);
+    fn new(txid: Txid, blockhash: FullHash) -> TxConfRow {
+        let txid = full_hash(&txid[..]);
         TxConfRow {
             key: TxConfKey {
                 code: b'C',
@@ -1661,5 +1645,48 @@ impl GetAmountVal for bitcoin::Amount {
 impl GetAmountVal for confidential::Value {
     fn amount_value(self) -> confidential::Value {
         self
+    }
+}
+
+// This is needed to bench private functions
+#[cfg(feature = "bench")]
+pub mod bench {
+    use crate::new_index::schema::IndexerConfig;
+    use crate::new_index::BlockEntry;
+    use crate::new_index::DBRow;
+    use crate::util::HeaderEntry;
+    use bitcoin::Block;
+
+    pub struct Data {
+        block_entry: BlockEntry,
+        iconfig: IndexerConfig,
+    }
+
+    impl Data {
+        pub fn new(block: Block) -> Data {
+            let iconfig = IndexerConfig {
+                light_mode: false,
+                address_search: false,
+                index_unspendables: false,
+                network: crate::chain::Network::Regtest,
+            };
+            let height = 702861;
+            let hash = block.block_hash();
+            let header = block.header.clone();
+            let block_entry = BlockEntry {
+                block,
+                entry: HeaderEntry::new(height, hash, header),
+                size: 0u32, // wrong but not needed for benching
+            };
+
+            Data {
+                block_entry,
+                iconfig,
+            }
+        }
+    }
+
+    pub fn add_blocks(data: &Data) -> Vec<DBRow> {
+        super::add_blocks(&[data.block_entry.clone()], &data.iconfig)
     }
 }

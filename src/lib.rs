@@ -12,7 +12,6 @@ extern crate log;
 extern crate serde_derive;
 #[macro_use]
 extern crate serde_json;
-
 #[macro_use]
 extern crate lazy_static;
 
@@ -29,3 +28,6 @@ pub mod util;
 
 #[cfg(feature = "liquid")]
 pub mod elements;
+
+#[cfg(feature = "otlp-tracing")]
+pub mod otlp_trace;

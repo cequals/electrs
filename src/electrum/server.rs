@@ -13,6 +13,8 @@ use crypto::sha2::Sha256;
 use error_chain::ChainedError;
 use serde_json::{from_str, Value};
 
+use electrs_macros::trace;
+
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
@@ -30,6 +32,7 @@ use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullH
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
+const MAX_ARRAY_BATCH: usize = 20;
 
 #[cfg(feature = "electrum-discovery")]
 use crate::electrum::{DiscoveryManager, ServerFeatures};
@@ -69,6 +72,7 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
 }
 
 // TODO: implement caching and delta updates
+#[trace]
 fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<FullHash> {
     if txs.is_empty() {
         None
@@ -261,6 +265,7 @@ impl Connection {
         }))
     }
 
+    #[trace]
     fn blockchain_estimatefee(&self, params: &[Value]) -> Result<Value> {
         let conf_target = usize_from_value(params.get(0), "blocks_count")?;
         let fee_rate = self
@@ -388,6 +393,7 @@ impl Connection {
         Ok(json!(rawtx.to_lower_hex_string()))
     }
 
+    #[trace]
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
         let txid = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
         let height = usize_from_value(params.get(1), "height")?;
@@ -425,12 +431,14 @@ impl Connection {
         }))
     }
 
+    #[trace(method = %method)]
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let timer = self
             .stats
             .latency
             .with_label_values(&[method])
             .start_timer();
+
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
@@ -480,6 +488,7 @@ impl Connection {
         })
     }
 
+    #[trace]
     fn update_subscriptions(&mut self) -> Result<Vec<Value>> {
         let timer = self
             .stats
@@ -537,57 +546,32 @@ impl Connection {
         Ok(())
     }
 
+    #[trace]
     fn handle_replies(&mut self, receiver: Receiver<Message>) -> Result<()> {
         let empty_params = json!([]);
         loop {
             let msg = receiver.recv().chain_err(|| "channel closed")?;
-            let start_time = Instant::now();
             trace!("RPC {:?}", msg);
             match msg {
                 Message::Request(line) => {
                     let cmd: Value = from_str(&line).chain_err(|| "invalid JSON format")?;
-                    match (
-                        cmd.get("method"),
-                        cmd.get("params").unwrap_or_else(|| &empty_params),
-                        cmd.get("id"),
-                    ) {
-                        (
-                            Some(&Value::String(ref method)),
-                            &Value::Array(ref params),
-                            Some(ref id),
-                        ) => {
-                            conditionally_log_rpc_event!(
-                                self,
-                                json!({
-                                    "event": "rpc request",
-                                    "id": id,
-                                    "method": method,
-                                    "params": if let Some(RpcLogging::Full) = self.rpc_logging {
-                                        json!(params)
-                                    } else {
-                                        Value::Null
-                                    }
-                                })
+                    if let Value::Array(arr) = cmd {
+                        if arr.len() > MAX_ARRAY_BATCH {
+                            bail!(
+                                "Too many elements in batch requests {} max:{}",
+                                arr.len(),
+                                MAX_ARRAY_BATCH
                             );
-
-                            let reply = self.handle_command(method, params, id)?;
-
-                            conditionally_log_rpc_event!(
-                                self,
-                                json!({
-                                    "event": "rpc response",
-                                    "method": method,
-                                    "payload_size": reply.to_string().as_bytes().len(),
-                                    "duration_micros": start_time.elapsed().as_micros(),
-                                    "id": id,
-                                })
-                            );
-
-                            self.send_values(&[reply])?
                         }
-                        _ => {
-                            bail!("invalid command: {}", cmd)
+                        let mut result = Vec::with_capacity(arr.len());
+                        for el in arr {
+                            let reply = self.handle_value(el, &empty_params)?;
+                            result.push(reply)
                         }
+                        self.send_values(&[Value::Array(result)])?
+                    } else {
+                        let reply = self.handle_value(cmd, &empty_params)?;
+                        self.send_values(&[reply])?
                     }
                 }
                 Message::PeriodicUpdate => {
@@ -601,6 +585,52 @@ impl Connection {
         }
     }
 
+    fn handle_value(&mut self, cmd: Value, empty_params: &Value) -> Result<Value> {
+        let start_time = Instant::now();
+        Ok(
+            match (
+                cmd.get("method"),
+                cmd.get("params").unwrap_or_else(|| empty_params),
+                cmd.get("id"),
+            ) {
+                (Some(&Value::String(ref method)), &Value::Array(ref params), Some(ref id)) => {
+                    conditionally_log_rpc_event!(
+                        self,
+                        json!({
+                            "event": "rpc request",
+                            "id": id,
+                            "method": method,
+                            "params": if let Some(RpcLogging::Full) = self.rpc_logging {
+                                json!(params)
+                            } else {
+                                Value::Null
+                            }
+                        })
+                    );
+
+                    let reply = self.handle_command(method, params, id)?;
+
+                    conditionally_log_rpc_event!(
+                        self,
+                        json!({
+                            "event": "rpc response",
+                            "method": method,
+                            "payload_size": reply.to_string().as_bytes().len(),
+                            "duration_micros": start_time.elapsed().as_micros(),
+                            "id": id,
+                        })
+                    );
+
+                    reply
+                }
+                _ => {
+                    bail!("invalid command: {}", cmd)
+                }
+            },
+        )
+    }
+
+    #[trace]
     fn parse_requests(mut reader: BufReader<TcpStream>, tx: &SyncSender<Message>) -> Result<()> {
         loop {
             let mut line = Vec::<u8>::new();
@@ -663,6 +693,7 @@ impl Connection {
     }
 }
 
+#[trace]
 fn get_history(
     query: &Query,
     scripthash: &[u8],

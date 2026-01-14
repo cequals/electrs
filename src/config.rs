@@ -131,19 +131,19 @@ impl Config {
             .arg(
                 Arg::with_name("electrum_rpc_addr")
                     .long("electrum-rpc-addr")
-                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet and '127.0.0.1:60401' for regtest)")
+                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet3, '127.0.0.1:40001' for testnet4 and '127.0.0.1:60401' for regtest)")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("http_addr")
                     .long("http-addr")
-                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet and '127.0.0.1:3002' for regtest)")
+                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet3 and '127.0.0.1:3004' for testnet4 and '127.0.0.1:3002' for regtest)")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("daemon_rpc_addr")
                     .long("daemon-rpc-addr")
-                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet and 127.0.0.1:18443 for regtest)")
+                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet3 and 127.0.0.1:48332 for testnet4 and 127.0.0.1:18443 for regtest)")
                     .takes_value(true),
             )
             .arg(
@@ -155,7 +155,7 @@ impl Config {
             .arg(
                 Arg::with_name("monitoring_addr")
                     .long("monitoring-addr")
-                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet and 127.0.0.1:24224 for regtest)")
+                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet3 and 127.0.0.1:44224 for testnet4 and 127.0.0.1:24224 for regtest)")
                     .takes_value(true),
             )
             .arg(
@@ -291,6 +291,8 @@ impl Config {
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 18332,
             #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 48332,
+            #[cfg(not(feature = "liquid"))]
             Network::Regtest => 18443,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 38332,
@@ -305,6 +307,8 @@ impl Config {
             Network::Bitcoin => 50001,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 60001,
+            #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 40001,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 60401,
             #[cfg(not(feature = "liquid"))]
@@ -323,6 +327,8 @@ impl Config {
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 3001,
             #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 3004,
+            #[cfg(not(feature = "liquid"))]
             Network::Regtest => 3002,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 3003,
@@ -339,6 +345,8 @@ impl Config {
             Network::Bitcoin => 4224,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 14224,
+            #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 44224,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 24224,
             #[cfg(not(feature = "liquid"))]
@@ -414,6 +422,7 @@ impl Config {
             stderrlog::Timestamp::Off
         });
         log.init().expect("logging initialization failed");
+
         let config = Config {
             log,
             network_type,
@@ -501,6 +510,8 @@ pub fn get_network_subdir(network: Network) -> Option<&'static str> {
         Network::Bitcoin => None,
         #[cfg(not(feature = "liquid"))]
         Network::Testnet => Some("testnet3"),
+        #[cfg(not(feature = "liquid"))]
+        Network::Testnet4 => Some("testnet4"),
         #[cfg(not(feature = "liquid"))]
         Network::Regtest => Some("regtest"),
         #[cfg(not(feature = "liquid"))]

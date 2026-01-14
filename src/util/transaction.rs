@@ -45,6 +45,22 @@ impl From<Option<BlockId>> for TransactionStatus {
     }
 }
 
+#[cfg(feature = "liquid")]
+pub fn optional_value_for_newer_blocks(
+    block_id: Option<BlockId>,
+    check_time: u32,
+    value: usize,
+) -> Option<usize> {
+    match block_id {
+        // use the provided value only if it was after the "activation" time
+        Some(b) if b.time >= check_time => Some(value),
+        // otherwise don't include it
+        Some(_) => None,
+        // also use the value for unconfirmed blocks
+        None => Some(value),
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct TxInput {
     pub txid: Txid,
@@ -115,4 +131,76 @@ where
     s.serialize_field("txid", &outpoint.txid)?;
     s.serialize_field("vout", &outpoint.vout)?;
     s.end()
+}
+
+#[cfg(all(test, feature = "liquid"))]
+mod test {
+    use super::optional_value_for_newer_blocks;
+    use crate::util::BlockId;
+    use bitcoin::hashes::Hash;
+    use elements::BlockHash;
+
+    #[test]
+    fn opt_value_newer_block() {
+        let value = 123;
+        let check_time = 32;
+        let hash = BlockHash::from_slice(&[0; 32]).unwrap();
+        let height = 456;
+
+        // unconfirmed block should include the value
+        let block_id = None;
+        assert_eq!(
+            optional_value_for_newer_blocks(block_id, check_time, value),
+            Some(value)
+        );
+
+        // block time before check_time should NOT include the value
+        let block_id = Some(BlockId {
+            height,
+            hash,
+            time: 0,
+        });
+        assert_eq!(
+            optional_value_for_newer_blocks(block_id, check_time, value),
+            None
+        );
+        let block_id = Some(BlockId {
+            height,
+            hash,
+            time: 31,
+        });
+        assert_eq!(
+            optional_value_for_newer_blocks(block_id, check_time, value),
+            None
+        );
+
+        // block time on or after check_time should include the value
+        let block_id = Some(BlockId {
+            height,
+            hash,
+            time: 32,
+        });
+        assert_eq!(
+            optional_value_for_newer_blocks(block_id, check_time, value),
+            Some(value)
+        );
+        let block_id = Some(BlockId {
+            height,
+            hash,
+            time: 33,
+        });
+        assert_eq!(
+            optional_value_for_newer_blocks(block_id, check_time, value),
+            Some(value)
+        );
+        let block_id = Some(BlockId {
+            height,
+            hash,
+            time: 333,
+        });
+        assert_eq!(
+            optional_value_for_newer_blocks(block_id, check_time, value),
+            Some(value)
+        );
+    }
 }

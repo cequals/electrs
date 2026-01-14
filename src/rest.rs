@@ -5,12 +5,13 @@ use crate::chain::{
 use crate::config::Config;
 use crate::errors;
 use crate::new_index::{compute_script_hash, Query, SpendingInput, Utxo};
+#[cfg(feature = "liquid")]
+use crate::util::optional_value_for_newer_blocks;
 use crate::util::{
     create_socket, electrum_merkle, extract_tx_prevouts, get_innerscripts, get_tx_fee, has_prevout,
     is_coinbase, BlockHeaderMeta, BlockId, FullHash, ScriptToAddr, ScriptToAsm, TransactionStatus,
     DEFAULT_BLOCKHASH,
 };
-
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode;
 
@@ -23,6 +24,8 @@ use tokio::sync::oneshot;
 
 use std::fs;
 use std::str::FromStr;
+
+use electrs_macros::trace;
 
 #[cfg(feature = "liquid")]
 use {
@@ -48,6 +51,8 @@ const ADDRESS_SEARCH_LIMIT: usize = 10;
 const ASSETS_PER_PAGE: usize = 25;
 #[cfg(feature = "liquid")]
 const ASSETS_MAX_PER_PAGE: usize = 100;
+#[cfg(feature = "liquid")]
+const START_OF_LIQUID_DISCOUNT_CT_POLICY: u32 = 1734120000; // Friday, December 13, 2024, 20:00 GMT
 
 const TTL_LONG: u32 = 157_784_630; // ttl for static resources (5 years)
 const TTL_SHORT: u32 = 10; // ttl for volatie resources
@@ -129,6 +134,14 @@ struct TransactionValue {
     fee: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TransactionStatus>,
+
+    #[cfg(feature = "liquid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discount_vsize: Option<usize>,
+
+    #[cfg(feature = "liquid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discount_weight: Option<usize>,
 }
 
 impl TransactionValue {
@@ -172,6 +185,20 @@ impl TransactionValue {
             weight: weight as u64,
             fee,
             status: Some(TransactionStatus::from(blockid)),
+
+            #[cfg(feature = "liquid")]
+            discount_vsize: optional_value_for_newer_blocks(
+                blockid,
+                START_OF_LIQUID_DISCOUNT_CT_POLICY,
+                tx.discount_vsize(),
+            ),
+
+            #[cfg(feature = "liquid")]
+            discount_weight: optional_value_for_newer_blocks(
+                blockid,
+                START_OF_LIQUID_DISCOUNT_CT_POLICY,
+                tx.discount_weight(),
+            ),
         }
     }
 }
@@ -582,6 +609,7 @@ impl Handle {
     }
 }
 
+#[trace]
 fn handle_request(
     method: Method,
     uri: hyper::Uri,
@@ -1160,6 +1188,7 @@ fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, Htt
         .unwrap())
 }
 
+#[trace]
 fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Body>, HttpError> {
     let mut values = Vec::new();
     let mut current_hash = match start_height {

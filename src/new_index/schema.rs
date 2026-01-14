@@ -21,9 +21,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::chain::{
+use crate::{chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
-};
+}, new_index::db_metrics::RocksDbMetrics};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -58,7 +58,7 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path, config: &Config) -> Self {
+    pub fn open(path: &Path, config: &Config, metrics: &Metrics) -> Self {
         let txstore_db = DB::open(&path.join("txstore"), config);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
@@ -68,6 +68,11 @@ impl Store {
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
         let cache_db = DB::open(&path.join("cache"), config);
+
+        let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
+        txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
+        history_db.start_stats_exporter(Arc::clone(&db_metrics), "history_db");
+        cache_db.start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
             let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
@@ -276,7 +281,26 @@ impl Indexer {
             to_add.len(),
             self.from
         );
-        start_fetcher(self.from, &daemon, to_add)?.map(|blocks| self.add(&blocks));
+
+        let mut fetcher_count = 0;
+        let mut blocks_fetched = 0;
+        let to_add_total = to_add.len();
+
+        start_fetcher(self.from, &daemon, to_add)?.map(|blocks|
+            {
+                if fetcher_count % 25 == 0 && to_add_total > 20 {
+                    info!("adding txes from blocks {}/{} ({:.1}%)",
+                        blocks_fetched,
+                        to_add_total,
+                        blocks_fetched as f32 / to_add_total as f32 * 100.0
+                    );
+                }
+                fetcher_count += 1;
+                blocks_fetched += blocks.len();
+
+                self.add(&blocks)
+            });
+
         self.start_auto_compactions(&self.store.txstore_db);
 
         let to_index = self.headers_to_index(&new_headers);
@@ -287,6 +311,7 @@ impl Indexer {
         );
         start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
         self.start_auto_compactions(&self.store.history_db);
+        self.start_auto_compactions(&self.store.cache_db);
 
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");

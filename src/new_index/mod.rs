@@ -1,4 +1,5 @@
 pub mod db;
+pub mod db_metrics;
 mod fetch;
 mod mempool;
 pub mod precache;

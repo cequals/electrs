@@ -41,7 +41,7 @@ pub struct Config {
     pub utxos_limit: usize,
     pub electrum_txs_limit: usize,
     pub electrum_banner: String,
-    pub electrum_rpc_logging: Option<RpcLogging>,
+    pub rpc_logging: RpcLogging,
     pub zmq_addr: Option<SocketAddr>,
 
     /// Enable compaction during initial sync
@@ -49,6 +49,24 @@ pub struct Config {
     /// By default compaction is off until initial sync is finished for performance reasons,
     /// however, this requires much more disk space.
     pub initial_sync_compaction: bool,
+
+    /// RocksDB block cache size in MB (per database)
+    /// Caches decompressed blocks in memory to avoid repeated decompression (CPU intensive)
+    /// Total memory usage = cache_size * 3_databases (txstore, history, cache)
+    /// Recommendation: Start with 1024MB for production
+    /// Higher values reduce CPU load from cache misses but use more RAM
+    pub db_block_cache_mb: usize,
+
+    /// RocksDB parallelism level (background compaction and flush threads)
+    /// Recommendation: Set to number of CPU cores for optimal performance
+    /// This configures max_background_jobs and thread pools automatically
+    pub db_parallelism: usize,
+
+    /// RocksDB write buffer size in MB (per database)
+    /// Each database uses this much RAM for in-memory writes before flushing to disk
+    /// Total RAM usage = write_buffer_size * max_write_buffer_number * 3_databases
+    /// Larger buffers = fewer flushes (less CPU) but more RAM usage
+    pub db_write_buffer_size_mb: usize,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
@@ -75,10 +93,6 @@ fn str_to_socketaddr(address: &str, what: &str) -> SocketAddr {
 impl Config {
     pub fn from_args() -> Config {
         let network_help = format!("Select network type ({})", Network::names().join(", "));
-        let rpc_logging_help = format!(
-            "Select RPC logging option ({})",
-            RpcLogging::options().join(", ")
-        );
 
         let args = App::new("Electrum Rust Server")
             .version(crate_version!())
@@ -207,15 +221,43 @@ impl Config {
                     .help("Welcome banner for the Electrum server, shown in the console to clients.")
                     .takes_value(true)
             ).arg(
-                Arg::with_name("electrum_rpc_logging")
-                    .long("electrum-rpc-logging")
-                    .help(&rpc_logging_help)
-                    .takes_value(true),
+                Arg::with_name("enable_json_rpc_logging")
+                    .long("enable-json-rpc-logging")
+                    .help("turns on rpc logging")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("hide_json_rpc_logging_parameters")
+                    .long("hide-json-rpc-logging-parameters")
+                    .help("disables parameter printing in rpc logs")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("anonymize_json_rpc_logging_source_ip")
+                    .long("anonymize-json-rpc-logging-source-ip")
+                    .help("enables ip anonymization in rpc logs")
+                    .takes_value(false)
             ).arg(
                 Arg::with_name("initial_sync_compaction")
                     .long("initial-sync-compaction")
                     .help("Perform compaction during initial sync (slower but less disk space required)")
             ).arg(
+                Arg::with_name("db_block_cache_mb")
+                    .long("db-block-cache-mb")
+                    .help("RocksDB block cache size in MB per database")
+                    .takes_value(true)
+                    .default_value("8")
+            ).arg(
+                Arg::with_name("db_parallelism")
+                    .long("db-parallelism")
+                    .help("RocksDB parallelism level. Set to number of CPU cores for optimal performance")
+                    .takes_value(true)
+                    .default_value("2")
+            ).arg(
+                Arg::with_name("db_write_buffer_size_mb")
+                    .long("db-write-buffer-size-mb")
+                    .help("RocksDB write buffer size in MB per database. RAM usage = size * max_write_buffers(2) * 3_databases")
+                    .takes_value(true)
+                    .default_value("256")
+             ).arg(
                 Arg::with_name("zmq_addr")
                     .long("zmq-addr")
                     .help("Optional zmq socket address of the bitcoind daemon")
@@ -437,9 +479,15 @@ impl Config {
             electrum_rpc_addr,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_banner,
-            electrum_rpc_logging: m
-                .value_of("electrum_rpc_logging")
-                .map(|option| RpcLogging::from(option)),
+            rpc_logging: {
+                let params = RpcLogging {
+                    enabled: m.is_present("enable_json_rpc_logging"),
+                    hide_params: m.is_present("hide_json_rpc_logging_parameters"),
+                    anonymize_ip: m.is_present("anonymize_json_rpc_logging_source_ip"),
+                };
+                params.validate();
+                params
+            },
             http_addr,
             http_socket_file,
             monitoring_addr,
@@ -450,6 +498,9 @@ impl Config {
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
             initial_sync_compaction: m.is_present("initial_sync_compaction"),
+            db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
+            db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
+            db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
             zmq_addr,
 
             #[cfg(feature = "liquid")]
@@ -481,25 +532,17 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum RpcLogging {
-    Full,
-    NoParams,
+#[derive(Debug, Default, Clone)]
+pub struct RpcLogging {
+    pub enabled: bool,
+    pub hide_params: bool,
+    pub anonymize_ip: bool,
 }
 
 impl RpcLogging {
-    pub fn options() -> Vec<String> {
-        return vec!["full".to_string(), "no-params".to_string()];
-    }
-}
-
-impl From<&str> for RpcLogging {
-    fn from(option: &str) -> Self {
-        match option {
-            "full" => RpcLogging::Full,
-            "no-params" => RpcLogging::NoParams,
-
-            _ => panic!("unsupported RPC logging option: {:?}", option),
+    pub fn validate(&self) {
+        if !self.enabled && (self.hide_params || self.anonymize_ip) {
+            panic!("Flags '--hide-json-rpc-logging-parameters' or '--anonymize-json-rpc-logging-source-ip' require '--enable-json-rpc-logging'");
         }
     }
 }

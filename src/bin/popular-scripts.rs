@@ -2,14 +2,13 @@ extern crate electrs;
 
 use bitcoin::hex::DisplayHex;
 use electrs::{
-    config::Config,
-    new_index::{Store, TxHistoryKey},
-    util::bincode,
+    config::Config, metrics::Metrics, new_index::{Store, TxHistoryKey}, util::bincode
 };
 
 fn main() {
     let config = Config::from_args();
-    let store = Store::open(&config.db_path.join("newindex"), &config);
+    let metrics = Metrics::new(config.monitoring_addr);
+    let store = Store::open(&config.db_path.join("newindex"), &config, &metrics);
 
     let mut iter = store.history_db().raw_iterator();
     iter.seek(b"H");

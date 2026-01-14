@@ -23,7 +23,8 @@ fn main() {
 
     let signal = Waiter::start(crossbeam_channel::never());
     let config = Config::from_args();
-    let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+    let metrics = Metrics::new(config.monitoring_addr);
+    let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config, &metrics));
 
     let metrics = Metrics::new(config.monitoring_addr);
     metrics.start();

@@ -27,6 +27,7 @@ use electrs::{
     rest,
     signal::Waiter,
 };
+use electrs::config::RpcLogging;
 
 pub struct TestRunner {
     config: Arc<Config>,
@@ -38,6 +39,7 @@ pub struct TestRunner {
     daemon: Arc<Daemon>,
     mempool: Arc<RwLock<Mempool>>,
     metrics: Metrics,
+    salt_rwlock: Arc<RwLock<String>>,
 }
 
 impl TestRunner {
@@ -109,7 +111,7 @@ impl TestRunner {
             utxos_limit: 100,
             electrum_txs_limit: 100,
             electrum_banner: "".into(),
-            electrum_rpc_logging: None,
+            rpc_logging: RpcLogging::default(),
             zmq_addr: None,
 
             #[cfg(feature = "liquid")]
@@ -119,6 +121,9 @@ impl TestRunner {
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
             initial_sync_compaction: false,
+            db_block_cache_mb: 8,
+            db_parallelism: 2,
+            db_write_buffer_size_mb: 256,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
@@ -144,7 +149,7 @@ impl TestRunner {
             &metrics,
         )?);
 
-        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config, &metrics));
 
         let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
             // run the initial indexing from the blk files then switch to using the jsonrpc,
@@ -184,6 +189,8 @@ impl TestRunner {
             None, // TODO
         ));
 
+        let salt_rwlock = Arc::new(RwLock::new(String::from("foobar")));
+
         Ok(TestRunner {
             config,
             node,
@@ -193,6 +200,7 @@ impl TestRunner {
             daemon,
             mempool,
             metrics,
+            salt_rwlock,
         })
     }
 
@@ -285,6 +293,7 @@ pub fn init_electrum_tester() -> Result<(ElectrumRPC, net::SocketAddr, TestRunne
         Arc::clone(&tester.config),
         Arc::clone(&tester.query),
         &tester.metrics,
+        Arc::clone(&tester.salt_rwlock),
     );
     log::info!(
         "Electrum server running on {}",

@@ -15,7 +15,7 @@ use crate::util::{
 use bitcoin::consensus::encode;
 
 use bitcoin::hashes::FromSliceError as HashError;
-use hex::{DisplayHex, FromHex};
+use bitcoin::hex::{self, DisplayHex, FromHex};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server, StatusCode};
 use hyperlocal::UnixServerExt;
@@ -160,7 +160,7 @@ impl TransactionValue {
         let weight = weight.to_wu();
 
         TransactionValue {
-            txid: tx.txid(),
+            txid: tx.compute_txid(),
             #[cfg(not(feature = "liquid"))]
             version: tx.version.0 as u32,
             #[cfg(feature = "liquid")]
@@ -321,7 +321,7 @@ impl TxOutValue {
             "v0_p2wsh"
         } else if script.is_p2tr() {
             "v1_p2tr"
-        } else if script.is_provably_unspendable() {
+        } else if script.is_op_return() {
             "provably_unspendable"
         } else {
             "unknown"
@@ -992,9 +992,7 @@ fn handle_request(
                     .ok_or_else(|| HttpError::from("Missing tx".to_string()))?,
                 _ => return http_message(StatusCode::METHOD_NOT_ALLOWED, "Invalid method", 0),
             };
-            let txid = query
-                .broadcast_raw(&txhex)
-                .map_err(|err| HttpError::from(err.description().to_string()))?;
+            let txid = query.broadcast_raw(&txhex)?;
             http_message(StatusCode::OK, txid.to_string(), 0)
         }
 
@@ -1272,12 +1270,6 @@ impl From<hex::HexToArrayError> for HttpError {
     fn from(_e: hex::HexToArrayError) -> Self {
         //HttpError::from(e.description().to_string())
         HttpError::from("Invalid hex string".to_string())
-    }
-}
-impl From<bitcoin::address::Error> for HttpError {
-    fn from(_e: bitcoin::address::Error) -> Self {
-        //HttpError::from(e.description().to_string())
-        HttpError::from("Invalid Bitcoin address".to_string())
     }
 }
 impl From<errors::Error> for HttpError {

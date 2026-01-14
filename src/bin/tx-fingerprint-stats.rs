@@ -63,7 +63,7 @@ fn main() {
         }
 
         let tx: Transaction = deserialize(&value).expect("failed to parse Transaction");
-        let txid = tx.txid();
+        let txid = tx.compute_txid();
 
         iter.next();
 

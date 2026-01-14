@@ -168,6 +168,23 @@ fn test_rest() -> Result<()> {
     tester.mine()?;
     assert_eq!(get_json("/mempool")?["count"].as_u64(), Some(0));
 
+    // Test POST /tx
+    let txid = tester.send(&addr1, "9.9 BTC".parse().unwrap())?;
+    let tx_hex = get_plain(&format!("/tx/{}/hex", txid))?;
+    // Re-send the tx created by send(). It'll be accepted again since its still in the mempool.
+    let broadcast1_resp = ureq::post(&format!("http://{}/tx", rest_addr)).send_string(&tx_hex)?;
+    assert_eq!(broadcast1_resp.status(), 200);
+    assert_eq!(broadcast1_resp.into_string()?, txid.to_string());
+    // Mine the tx then submit it again. Should now fail.
+    tester.mine()?;
+    let broadcast2_res = ureq::post(&format!("http://{}/tx", rest_addr)).send_string(&tx_hex);
+    let broadcast2_resp = broadcast2_res.unwrap_err().into_response().unwrap();
+    assert_eq!(broadcast2_resp.status(), 400);
+    assert_eq!(
+        broadcast2_resp.into_string()?,
+        "sendrawtransaction RPC error -27: Transaction already in block chain"
+    );
+
     // Elements-only tests
     #[cfg(feature = "liquid")]
     {
@@ -296,22 +313,35 @@ fn test_rest() -> Result<()> {
 
         // Test GET /block/:hash
         {
-            let bestblockhash = get_plain("/blocks/tip/hash")?;
-            let block = get_json(&format!("/block/{}", bestblockhash))?;
+            let block1_hash = get_plain("/block-height/1")?;
+            let block1 = get_json(&format!("/block/{}", block1_hash))?;
 
             // No PoW-related stuff
-            assert!(block["bits"].is_null());
-            assert!(block["nonce"].is_null());
-            assert!(block["difficulty"].is_null());
+            assert!(block1["bits"].is_null());
+            assert!(block1["nonce"].is_null());
+            assert!(block1["difficulty"].is_null());
 
             // Dynamic Federations (dynafed) fields
-            assert!(block["ext"]["current"]["signblockscript"].is_string());
-            assert!(block["ext"]["current"]["fedpegscript"].is_string());
-            assert!(block["ext"]["current"]["fedpeg_program"].is_string());
-            assert!(block["ext"]["current"]["signblock_witness_limit"].is_u64());
-            assert!(block["ext"]["current"]["extension_space"].is_array());
-            assert!(block["ext"]["proposed"].is_object());
-            assert!(block["ext"]["signblock_witness"].is_array());
+            // Block #1 should have the Full dynafed params
+            // See https://docs.rs/elements/latest/elements/dynafed/enum.Params.html
+            assert!(block1["ext"]["current"]["signblockscript"].is_string());
+            assert!(block1["ext"]["current"]["fedpegscript"].is_string());
+            assert!(block1["ext"]["current"]["fedpeg_program"].is_string());
+            assert!(block1["ext"]["current"]["signblock_witness_limit"].is_u64());
+            assert!(block1["ext"]["current"]["extension_space"].is_array());
+            assert!(block1["ext"]["proposed"].is_object());
+            assert!(block1["ext"]["signblock_witness"].is_array());
+
+            // Block #2 should have the Compact params
+            let block2_hash = get_plain("/block-height/2")?;
+            let block2 = get_json(&format!("/block/{}", block2_hash))?;
+            assert!(block2["ext"]["current"]["signblockscript"].is_string());
+            assert!(block2["ext"]["current"]["signblock_witness_limit"].is_u64());
+            // With the `elided_root` in place of `fedpegscript`/`fedpeg_program`/`extension_space``
+            assert!(block2["ext"]["current"]["elided_root"].is_string());
+            assert!(block2["ext"]["current"]["fedpegscript"].is_null());
+            assert!(block2["ext"]["current"]["fedpeg_program"].is_null());
+            assert!(block2["ext"]["current"]["extension_space"].is_null());
         }
     }
 

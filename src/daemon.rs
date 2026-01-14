@@ -10,8 +10,8 @@ use std::time::Duration;
 use std::{env, fs, io};
 
 use base64::prelude::{Engine, BASE64_STANDARD};
+use bitcoin::hex::FromHex;
 use error_chain::ChainedError;
-use hex::FromHex;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde_json::{from_str, from_value, Value};
 
@@ -88,10 +88,13 @@ fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Resu
         if let Some(err) = reply_obj.get_mut("error") {
             if !err.is_null() {
                 if let Some(code) = parse_error_code(&err) {
+                    let msg = err["message"]
+                        .as_str()
+                        .map_or_else(|| err.to_string(), |s| s.to_string());
                     match code {
                         // RPC_IN_WARMUP -> retry by later reconnection
                         -28 => bail!(ErrorKind::Connection(err.to_string())),
-                        code => bail!(ErrorKind::RpcError(code, err.take(), method.to_string())),
+                        code => bail!(ErrorKind::RpcError(code, msg, method.to_string())),
                     }
                 }
             }

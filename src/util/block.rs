@@ -9,6 +9,8 @@ use std::slice;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime as DateTime;
 
+use electrs_macros::trace;
+
 const MTP_SPAN: usize = 11;
 
 lazy_static! {
@@ -18,7 +20,7 @@ lazy_static! {
             .unwrap();
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct BlockId {
     pub height: usize,
     pub hash: BlockHash,
@@ -43,6 +45,14 @@ pub struct HeaderEntry {
 }
 
 impl HeaderEntry {
+    #[cfg(feature = "bench")]
+    pub fn new(height: usize, hash: BlockHash, header: BlockHeader) -> Self {
+        Self {
+            height,
+            hash,
+            header,
+        }
+    }
     pub fn hash(&self) -> &BlockHash {
         &self.hash
     }
@@ -84,6 +94,7 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn new(
         mut headers_map: HashMap<BlockHash, BlockHeader>,
         tip_hash: BlockHash,
@@ -121,6 +132,7 @@ impl HeaderList {
         headers
     }
 
+    #[trace]
     pub fn order(&self, new_headers: Vec<BlockHeader>) -> Vec<HeaderEntry> {
         // header[i] -> header[i-1] (i.e. header.last() is the tip)
         struct HashedHeader {
@@ -160,6 +172,7 @@ impl HeaderList {
             .collect()
     }
 
+    #[trace]
     pub fn apply(&mut self, new_headers: Vec<HeaderEntry>) {
         // new_headers[i] -> new_headers[i - 1] (i.e. new_headers.last() is the tip)
         for i in 1..new_headers.len() {
@@ -197,6 +210,7 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn header_by_blockhash(&self, blockhash: &BlockHash) -> Option<&HeaderEntry> {
         let height = self.heights.get(blockhash)?;
         let header = self.headers.get(*height)?;
@@ -207,6 +221,7 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn header_by_height(&self, height: usize) -> Option<&HeaderEntry> {
         self.headers.get(height).map(|entry| {
             assert_eq!(entry.height(), height);

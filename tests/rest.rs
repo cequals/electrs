@@ -40,6 +40,11 @@ fn test_rest() -> Result<()> {
         vout["scriptpubkey_address"].as_str() == Some(&addr1.to_string())
             && vout["value"].as_u64() == Some(119123000)
     }));
+    #[cfg(feature = "liquid")]
+    {
+        assert_eq!(res["discount_vsize"].as_u64().unwrap(), 228);
+        assert_eq!(res["discount_weight"].as_u64().unwrap(), 912);
+    }
 
     // Test GET /tx/:txid/status
     let res = get_json(&format!("/tx/{}/status", txid1_confirmed))?;
@@ -167,6 +172,178 @@ fn test_rest() -> Result<()> {
 
     tester.mine()?;
     assert_eq!(get_json("/mempool")?["count"].as_u64(), Some(0));
+
+    // Test POST /tx
+    let txid = tester.send(&addr1, "9.9 BTC".parse().unwrap())?;
+    let tx_hex = get_plain(&format!("/tx/{}/hex", txid))?;
+    // Re-send the tx created by send(). It'll be accepted again since its still in the mempool.
+    let broadcast1_resp = ureq::post(&format!("http://{}/tx", rest_addr)).send_string(&tx_hex)?;
+    assert_eq!(broadcast1_resp.status(), 200);
+    assert_eq!(broadcast1_resp.into_string()?, txid.to_string());
+    // Mine the tx then submit it again. Should now fail.
+    tester.mine()?;
+    let broadcast2_res = ureq::post(&format!("http://{}/tx", rest_addr)).send_string(&tx_hex);
+    let broadcast2_resp = broadcast2_res.unwrap_err().into_response().unwrap();
+    assert_eq!(broadcast2_resp.status(), 400);
+
+    // Test POST /txs/package - simple validation test
+    // Test with invalid JSON first to verify the endpoint exists
+    let invalid_package_result = ureq::post(&format!("http://{}/txs/package", rest_addr))
+        .set("Content-Type", "application/json")
+        .send_string("invalid json");
+    let invalid_package_resp = invalid_package_result.unwrap_err().into_response().unwrap();
+    let status = invalid_package_resp.status();
+    // Should be 400 for bad JSON, not 404 for missing endpoint
+    assert_eq!(
+        status, 400,
+        "Endpoint should exist and return 400 for invalid JSON"
+    );
+
+    // Now test with valid but empty package, should fail
+    let empty_package_result = ureq::post(&format!("http://{}/txs/package", rest_addr))
+        .set("Content-Type", "application/json")
+        .send_string("[]");
+    let empty_package_resp = empty_package_result.unwrap_err().into_response().unwrap();
+    let status = empty_package_resp.status();
+    assert_eq!(status, 400);
+
+    // bitcoin 28.0 only tests - submitpackage
+    #[cfg(all(not(feature = "liquid"), feature = "bitcoind_28_0"))]
+    {
+        // Test with a real transaction package - create parent-child transactions
+        // submitpackage requires between 2 and 25 transactions with proper dependencies
+        let package_addr1 = tester.newaddress()?;
+        let package_addr2 = tester.newaddress()?;
+
+        // Create parent transaction
+        let tx1_result = tester.node_client().call::<Value>(
+            "createrawtransaction",
+            &[
+                serde_json::json!([]),
+                serde_json::json!({package_addr1.to_string(): 0.5}),
+            ],
+        )?;
+        let tx1_unsigned_hex = tx1_result.as_str().expect("raw tx hex").to_string();
+
+        let tx1_fund_result = tester
+            .node_client()
+            .call::<Value>("fundrawtransaction", &[serde_json::json!(tx1_unsigned_hex)])?;
+        let tx1_funded_hex = tx1_fund_result["hex"]
+            .as_str()
+            .expect("funded tx hex")
+            .to_string();
+
+        let tx1_sign_result = tester.node_client().call::<Value>(
+            "signrawtransactionwithwallet",
+            &[serde_json::json!(tx1_funded_hex)],
+        )?;
+        let tx1_signed_hex = tx1_sign_result["hex"]
+            .as_str()
+            .expect("signed tx hex")
+            .to_string();
+
+        // Decode parent transaction to get its txid and find the output to spend
+        let tx1_decoded = tester
+            .node_client()
+            .call::<Value>("decoderawtransaction", &[serde_json::json!(tx1_signed_hex)])?;
+        let tx1_txid = tx1_decoded["txid"].as_str().expect("parent txid");
+
+        // Find the output going to package_addr1 (the one we want to spend)
+        let tx1_vouts = tx1_decoded["vout"].as_array().expect("parent vouts");
+        let mut spend_vout_index = None;
+        let mut spend_vout_value = 0u64;
+
+        for (i, vout) in tx1_vouts.iter().enumerate() {
+            if let Some(script_pub_key) = vout.get("scriptPubKey") {
+                if let Some(address) = script_pub_key.get("address") {
+                    if address.as_str() == Some(&package_addr1.to_string()) {
+                        spend_vout_index = Some(i);
+                        // Convert from BTC to satoshis
+                        spend_vout_value =
+                            (vout["value"].as_f64().expect("vout value") * 100_000_000.0) as u64;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let spend_vout_index = spend_vout_index.expect("Could not find output to spend");
+
+        // Create child transaction that spends from parent
+        // Leave some satoshis for fee (e.g., 1000 sats)
+        let child_output_value = spend_vout_value - 1000;
+        let child_output_btc = child_output_value as f64 / 100_000_000.0;
+
+        let tx2_result = tester.node_client().call::<Value>(
+            "createrawtransaction",
+            &[
+                serde_json::json!([{
+                    "txid": tx1_txid,
+                    "vout": spend_vout_index
+                }]),
+                serde_json::json!({package_addr2.to_string(): child_output_btc}),
+            ],
+        )?;
+        let tx2_unsigned_hex = tx2_result.as_str().expect("raw tx hex").to_string();
+
+        // Sign the child transaction
+        // We need to provide the parent transaction's output details for signing
+        let tx2_sign_result = tester.node_client().call::<Value>(
+        "signrawtransactionwithwallet",
+        &[
+            serde_json::json!(tx2_unsigned_hex),
+            serde_json::json!([{
+                "txid": tx1_txid,
+                "vout": spend_vout_index,
+                "scriptPubKey": tx1_vouts[spend_vout_index]["scriptPubKey"]["hex"].as_str().unwrap(),
+                "amount": spend_vout_value as f64 / 100_000_000.0
+            }])
+        ],
+    )?;
+        let tx2_signed_hex = tx2_sign_result["hex"]
+            .as_str()
+            .expect("signed tx hex")
+            .to_string();
+
+        // Debug: try calling submitpackage directly to see the result
+        eprintln!("Trying submitpackage directly with parent-child transactions...");
+        let direct_result = tester.node_client().call::<Value>(
+            "submitpackage",
+            &[serde_json::json!([
+                tx1_signed_hex.clone(),
+                tx2_signed_hex.clone()
+            ])],
+        );
+        match direct_result {
+            Ok(result) => {
+                eprintln!("Direct submitpackage succeeded: {:#?}", result);
+            }
+            Err(e) => {
+                eprintln!("Direct submitpackage failed: {:?}", e);
+            }
+        }
+
+        // Now submit this transaction package via the package endpoint
+        let package_json =
+            serde_json::json!([tx1_signed_hex.clone(), tx2_signed_hex.clone()]).to_string();
+        let package_result = ureq::post(&format!("http://{}/txs/package", rest_addr))
+            .set("Content-Type", "application/json")
+            .send_string(&package_json);
+
+        let package_resp = package_result.unwrap();
+        assert_eq!(package_resp.status(), 200);
+        let package_result = package_resp.into_json::<Value>()?;
+
+        // Verify the response structure
+        assert!(package_result["tx-results"].is_object());
+        assert!(package_result["package_msg"].is_string());
+
+        let tx_results = package_result["tx-results"].as_object().unwrap();
+        assert_eq!(tx_results.len(), 2);
+
+        // The transactions should be processed (whether accepted or rejected)
+        assert!(!tx_results.is_empty());
+    }
 
     // Elements-only tests
     #[cfg(feature = "liquid")]
@@ -296,22 +473,35 @@ fn test_rest() -> Result<()> {
 
         // Test GET /block/:hash
         {
-            let bestblockhash = get_plain("/blocks/tip/hash")?;
-            let block = get_json(&format!("/block/{}", bestblockhash))?;
+            let block1_hash = get_plain("/block-height/1")?;
+            let block1 = get_json(&format!("/block/{}", block1_hash))?;
 
             // No PoW-related stuff
-            assert!(block["bits"].is_null());
-            assert!(block["nonce"].is_null());
-            assert!(block["difficulty"].is_null());
+            assert!(block1["bits"].is_null());
+            assert!(block1["nonce"].is_null());
+            assert!(block1["difficulty"].is_null());
 
             // Dynamic Federations (dynafed) fields
-            assert!(block["ext"]["current"]["signblockscript"].is_string());
-            assert!(block["ext"]["current"]["fedpegscript"].is_string());
-            assert!(block["ext"]["current"]["fedpeg_program"].is_string());
-            assert!(block["ext"]["current"]["signblock_witness_limit"].is_u64());
-            assert!(block["ext"]["current"]["extension_space"].is_array());
-            assert!(block["ext"]["proposed"].is_object());
-            assert!(block["ext"]["signblock_witness"].is_array());
+            // Block #1 should have the Full dynafed params
+            // See https://docs.rs/elements/latest/elements/dynafed/enum.Params.html
+            assert!(block1["ext"]["current"]["signblockscript"].is_string());
+            assert!(block1["ext"]["current"]["fedpegscript"].is_string());
+            assert!(block1["ext"]["current"]["fedpeg_program"].is_string());
+            assert!(block1["ext"]["current"]["signblock_witness_limit"].is_u64());
+            assert!(block1["ext"]["current"]["extension_space"].is_array());
+            assert!(block1["ext"]["proposed"].is_object());
+            assert!(block1["ext"]["signblock_witness"].is_array());
+
+            // Block #2 should have the Compact params
+            let block2_hash = get_plain("/block-height/2")?;
+            let block2 = get_json(&format!("/block/{}", block2_hash))?;
+            assert!(block2["ext"]["current"]["signblockscript"].is_string());
+            assert!(block2["ext"]["current"]["signblock_witness_limit"].is_u64());
+            // With the `elided_root` in place of `fedpegscript`/`fedpeg_program`/`extension_space``
+            assert!(block2["ext"]["current"]["elided_root"].is_string());
+            assert!(block2["ext"]["current"]["fedpegscript"].is_null());
+            assert!(block2["ext"]["current"]["fedpeg_program"].is_null());
+            assert!(block2["ext"]["current"]["extension_space"].is_null());
         }
     }
 

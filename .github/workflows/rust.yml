@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - new-index
+  pull_request: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run cargo check --all-targets
+      run: cargo check --all-targets
+
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+    - run: sudo apt-get update && sudo apt-get install libfuse2
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests (Bitcoin mode, REST+Electrum)
+      run: RUST_LOG=debug cargo test
+
+  test-bitcoin-28:
+    runs-on: ubuntu-22.04
+    steps:
+    - run: sudo apt-get update && sudo apt-get install libfuse2
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Download bitcoind 28.0
+      run: |
+        curl -sSL https://bitcoincore.org/bin/bitcoin-core-28.0/bitcoin-28.0-x86_64-linux-gnu.tar.gz | tar -xz
+        chmod +x bitcoin-28.0/bin/bitcoind
+    - name: Run tests (Bitcoin 28.0, REST+Electrum)
+      run: RUST_LOG=debug cargo test --features bitcoind_28_0
+      env:
+        BITCOIND_EXE: ${{ github.workspace }}/bitcoin-28.0/bin/bitcoind
+
+  test-electrum-raw:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run test test_electrum_raw
+      run: RUST_LOG=debug cargo test -- --include-ignored test_electrum_raw
+
+  test-liquid:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests (Liquid mode, REST)
+      run: RUST_LOG=debug cargo test --features liquid
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix build .

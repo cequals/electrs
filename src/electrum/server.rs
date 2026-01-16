@@ -1,23 +1,24 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Instant;
 
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
+use bitcoin::hex::DisplayHex;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use error_chain::ChainedError;
-use hex::{self, DisplayHex};
 use serde_json::{from_str, Value};
+
+use electrs_macros::trace;
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
 use elements::encode::serialize_hex;
-
 use crate::chain::Txid;
 use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
@@ -25,13 +26,12 @@ use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
-use crate::util::{
-    create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry, SyncChannel,
-};
+use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
 const MAX_HEADERS: usize = 2016;
+const MAX_ARRAY_BATCH: usize = 20;
 
 #[cfg(feature = "electrum-discovery")]
 use crate::electrum::{DiscoveryManager, ServerFeatures};
@@ -71,6 +71,7 @@ fn bool_from_value_or(val: Option<&Value>, name: &str, default: bool) -> Result<
 }
 
 // TODO: implement caching and delta updates
+#[trace]
 fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<FullHash> {
     if txs.is_empty() {
         None
@@ -93,7 +94,7 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
 
 macro_rules! conditionally_log_rpc_event {
     ($self:ident, $event:expr) => {
-        if $self.rpc_logging.is_some() {
+        if $self.rpc_logging.enabled {
             $self.log_rpc_event($event);
         }
     };
@@ -105,12 +106,13 @@ struct Connection {
     status_hashes: HashMap<Sha256dHash, Value>, // ScriptHash -> StatusHash
     stream: TcpStream,
     addr: SocketAddr,
-    chan: SyncChannel<Message>,
+    sender: SyncSender<Message>,
     stats: Arc<Stats>,
     txs_limit: usize,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
-    rpc_logging: Option<RpcLogging>,
+    rpc_logging: RpcLogging,
+    salt: String,
 }
 
 impl Connection {
@@ -118,10 +120,12 @@ impl Connection {
         query: Arc<Query>,
         stream: TcpStream,
         addr: SocketAddr,
+        sender: SyncSender<Message>,
         stats: Arc<Stats>,
         txs_limit: usize,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
-        rpc_logging: Option<RpcLogging>,
+        rpc_logging: RpcLogging,
+        salt: String,
     ) -> Connection {
         Connection {
             query,
@@ -129,12 +133,13 @@ impl Connection {
             status_hashes: HashMap::new(),
             stream,
             addr,
-            chan: SyncChannel::new(10),
+            sender,
             stats,
             txs_limit,
             #[cfg(feature = "electrum-discovery")]
             discovery,
             rpc_logging,
+            salt,
         }
     }
 
@@ -262,6 +267,7 @@ impl Connection {
         }))
     }
 
+    #[trace]
     fn blockchain_estimatefee(&self, params: &[Value]) -> Result<Value> {
         let conf_target = usize_from_value(params.get(0), "blocks_count")?;
         let fee_rate = self
@@ -289,6 +295,18 @@ impl Connection {
             self.stats.subscriptions.inc();
         }
         Ok(status_hash)
+    }
+
+    fn blockchain_scripthash_unsubscribe(&mut self, params: &[Value]) -> Result<Value> {
+        let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
+
+        match self.status_hashes.remove(&script_hash) {
+            None => Ok(json!(false)),
+            Some(_) => {
+                self.stats.subscriptions.dec();
+                Ok(json!(true))
+            }
+        }
     }
 
     #[cfg(not(feature = "liquid"))]
@@ -352,7 +370,7 @@ impl Connection {
         let tx = params.get(0).chain_err(|| "missing tx")?;
         let tx = tx.as_str().chain_err(|| "non-string tx")?.to_string();
         let txid = self.query.broadcast_raw(&tx)?;
-        if let Err(e) = self.chan.sender().try_send(Message::PeriodicUpdate) {
+        if let Err(e) = self.sender.try_send(Message::PeriodicUpdate) {
             warn!("failed to issue PeriodicUpdate after broadcast: {}", e);
         }
         Ok(json!(txid))
@@ -377,6 +395,7 @@ impl Connection {
         Ok(json!(rawtx.to_lower_hex_string()))
     }
 
+    #[trace]
     fn blockchain_transaction_get_merkle(&self, params: &[Value]) -> Result<Value> {
         let txid = Txid::from(hash_from_value(params.get(0)).chain_err(|| "bad tx_hash")?);
         let height = usize_from_value(params.get(1), "height")?;
@@ -391,9 +410,10 @@ impl Connection {
         let (merkle, pos) = get_tx_merkle_proof(self.query.chain(), &txid, &blockid.hash)
             .chain_err(|| "cannot create merkle proof")?;
         Ok(json!({
-                "block_height": blockid.height,
-                "merkle": merkle,
-                "pos": pos}))
+            "block_height": blockid.height,
+            "merkle": merkle,
+            "pos": pos
+        }))
     }
 
     fn blockchain_transaction_id_from_pos(&self, params: &[Value]) -> Result<Value> {
@@ -409,15 +429,18 @@ impl Connection {
 
         Ok(json!({
             "tx_hash": txid,
-            "merkle" : merkle}))
+            "merkle" : merkle
+        }))
     }
 
+    #[trace(method = %method)]
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let timer = self
             .stats
             .latency
             .with_label_values(&[method])
             .start_timer();
+
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
@@ -429,6 +452,7 @@ impl Connection {
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(&params),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(&params),
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
+            "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(&params),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
@@ -466,6 +490,7 @@ impl Connection {
         })
     }
 
+    #[trace]
     fn update_subscriptions(&mut self) -> Result<Vec<Value>> {
         let timer = self
             .stats
@@ -502,11 +527,25 @@ impl Connection {
         Ok(result)
     }
 
+    fn hash_ip_with_salt(&self, ip: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.input(self.salt.as_bytes());
+        hasher.input(ip.as_bytes());
+        hasher.result_str()
+    }
+
     fn log_rpc_event(&self, mut log: Value) {
+        let real_ip = self.addr.ip().to_string();
+        let ip_to_log = if self.rpc_logging.anonymize_ip {
+            self.hash_ip_with_salt(&real_ip)
+        } else {
+            real_ip
+        };
+
         log.as_object_mut().unwrap().insert(
             "source".into(),
             json!({
-                "ip": self.addr.ip().to_string(),
+                "ip": ip_to_log,
                 "port": self.addr.port(),
             }),
         );
@@ -523,57 +562,32 @@ impl Connection {
         Ok(())
     }
 
-    fn handle_replies(&mut self) -> Result<()> {
+    #[trace]
+    fn handle_replies(&mut self, receiver: Receiver<Message>) -> Result<()> {
         let empty_params = json!([]);
         loop {
-            let msg = self.chan.receiver().recv().chain_err(|| "channel closed")?;
-            let start_time = Instant::now();
+            let msg = receiver.recv().chain_err(|| "channel closed")?;
             trace!("RPC {:?}", msg);
             match msg {
                 Message::Request(line) => {
                     let cmd: Value = from_str(&line).chain_err(|| "invalid JSON format")?;
-                    match (
-                        cmd.get("method"),
-                        cmd.get("params").unwrap_or_else(|| &empty_params),
-                        cmd.get("id"),
-                    ) {
-                        (
-                            Some(&Value::String(ref method)),
-                            &Value::Array(ref params),
-                            Some(ref id),
-                        ) => {
-                            conditionally_log_rpc_event!(
-                                self,
-                                json!({
-                                    "event": "rpc request",
-                                    "id": id,
-                                    "method": method,
-                                    "params": if let Some(RpcLogging::Full) = self.rpc_logging {
-                                        json!(params)
-                                    } else {
-                                        Value::Null
-                                    }
-                                })
+                    if let Value::Array(arr) = cmd {
+                        if arr.len() > MAX_ARRAY_BATCH {
+                            bail!(
+                                "Too many elements in batch requests {} max:{}",
+                                arr.len(),
+                                MAX_ARRAY_BATCH
                             );
-
-                            let reply = self.handle_command(method, params, id)?;
-
-                            conditionally_log_rpc_event!(
-                                self,
-                                json!({
-                                    "event": "rpc response",
-                                    "method": method,
-                                    "payload_size": reply.to_string().as_bytes().len(),
-                                    "duration_micros": start_time.elapsed().as_micros(),
-                                    "id": id,
-                                })
-                            );
-
-                            self.send_values(&[reply])?
                         }
-                        _ => {
-                            bail!("invalid command: {}", cmd)
+                        let mut result = Vec::with_capacity(arr.len());
+                        for el in arr {
+                            let reply = self.handle_value(el, &empty_params)?;
+                            result.push(reply)
                         }
+                        self.send_values(&[Value::Array(result)])?
+                    } else {
+                        let reply = self.handle_value(cmd, &empty_params)?;
+                        self.send_values(&[reply])?
                     }
                 }
                 Message::PeriodicUpdate => {
@@ -587,19 +601,55 @@ impl Connection {
         }
     }
 
-    fn handle_requests(mut reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
+    fn handle_value(&mut self, cmd: Value, empty_params: &Value) -> Result<Value> {
+        let start_time = Instant::now();
+        Ok(
+            match (
+                cmd.get("method"),
+                cmd.get("params").unwrap_or_else(|| empty_params),
+                cmd.get("id"),
+            ) {
+                (Some(&Value::String(ref method)), &Value::Array(ref params), Some(ref id)) => {
+                    let reply = self.handle_command(method, params, id)?;
+
+                    conditionally_log_rpc_event!(
+                        self,
+                        json!({
+                            "event": "rpc_response",
+                            "method": method,
+                            "params": if self.rpc_logging.hide_params {
+                                    Value::Null
+                                } else {
+                                    json!(params)
+                                },
+                            "request_size": serde_json::to_vec(&cmd).map(|v| v.len()).unwrap_or(0),
+                            "response_size": reply.to_string().as_bytes().len(),
+                            "duration_micros": start_time.elapsed().as_micros(),
+                            "id": id,
+                        })
+                    );
+
+                    reply
+                }
+                _ => {
+                    bail!("invalid command: {}", cmd)
+                }
+            },
+        )
+    }
+
+    #[trace]
+    fn parse_requests(mut reader: BufReader<TcpStream>, tx: &SyncSender<Message>) -> Result<()> {
         loop {
             let mut line = Vec::<u8>::new();
             reader
                 .read_until(b'\n', &mut line)
                 .chain_err(|| "failed to read a request")?;
             if line.is_empty() {
-                tx.send(Message::Done).chain_err(|| "channel closed")?;
                 return Ok(());
             } else {
                 if line.starts_with(&[22, 3, 1]) {
                     // (very) naive SSL handshake detection
-                    let _ = tx.send(Message::Done);
                     bail!("invalid request - maybe SSL-encrypted data?: {:?}", line)
                 }
                 match String::from_utf8(line) {
@@ -607,7 +657,6 @@ impl Connection {
                         .send(Message::Request(req))
                         .chain_err(|| "channel closed")?,
                     Err(err) => {
-                        let _ = tx.send(Message::Done);
                         bail!("invalid UTF8: {}", err)
                     }
                 }
@@ -615,14 +664,22 @@ impl Connection {
         }
     }
 
-    pub fn run(mut self) {
+    fn reader_thread(reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
+        let result = Connection::parse_requests(reader, &tx);
+        if let Err(e) = tx.send(Message::Done) {
+            warn!("failed closing channel: {}", e);
+        }
+        result
+    }
+
+    pub fn run(mut self, receiver: Receiver<Message>) {
         self.stats.clients.inc();
-        conditionally_log_rpc_event!(self, json!({ "event": "connection established" }));
+        conditionally_log_rpc_event!(self, json!({ "event": "connection_established" }));
 
         let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
-        let tx = self.chan.sender();
-        let child = spawn_thread("reader", || Connection::handle_requests(reader, tx));
-        if let Err(e) = self.handle_replies() {
+        let sender = self.sender.clone();
+        let child = spawn_thread("reader", || Connection::reader_thread(reader, sender));
+        if let Err(e) = self.handle_replies(receiver) {
             error!(
                 "[{}] connection handling failed: {}",
                 self.addr,
@@ -635,7 +692,7 @@ impl Connection {
             .sub(self.status_hashes.len() as i64);
 
         debug!("[{}] shutting down connection", self.addr);
-        conditionally_log_rpc_event!(self, json!({ "event": "connection closed" }));
+        conditionally_log_rpc_event!(self, json!({ "event": "connection_closed" }));
 
         let _ = self.stream.shutdown(Shutdown::Both);
         if let Err(err) = child.join().expect("receiver panicked") {
@@ -644,6 +701,7 @@ impl Connection {
     }
 }
 
+#[trace]
 fn get_history(
     query: &Query,
     scripthash: &[u8],
@@ -698,14 +756,15 @@ impl RPC {
                 let mut senders = senders.lock().unwrap();
                 match msg {
                     Notification::Periodic => {
-                        for sender in senders.split_off(0) {
+                        senders.retain(|sender| {
                             if let Err(TrySendError::Disconnected(_)) =
                                 sender.try_send(Message::PeriodicUpdate)
                             {
-                                continue;
+                                false // drop disconnected clients
+                            } else {
+                                true
                             }
-                            senders.push(sender);
-                        }
+                        })
                     }
                     Notification::Exit => acceptor.send(None).unwrap(), // mark acceptor as done
                 }
@@ -736,7 +795,12 @@ impl RPC {
         chan
     }
 
-    pub fn start(config: Arc<Config>, query: Arc<Query>, metrics: &Metrics) -> RPC {
+    pub fn start(
+        config: Arc<Config>,
+        query: Arc<Query>,
+        metrics: &Metrics,
+        salt_rwlock: Arc<RwLock<String>>
+    ) -> RPC {
         let stats = Arc::new(Stats {
             latency: metrics.histogram_vec(
                 HistogramOpts::new("electrum_rpc", "Electrum RPC latency (seconds)"),
@@ -792,14 +856,18 @@ impl RPC {
                 let (garbage_sender, garbage_receiver) = crossbeam_channel::unbounded();
 
                 while let Some((stream, addr)) = acceptor.receiver().recv().unwrap() {
-                    // explicitely scope the shadowed variables for the new thread
+                    // explicitly scope the shadowed variables for the new thread
                     let query = Arc::clone(&query);
-                    let senders = Arc::clone(&senders);
                     let stats = Arc::clone(&stats);
                     let garbage_sender = garbage_sender.clone();
+                    let rpc_logging = config.rpc_logging.clone();
                     #[cfg(feature = "electrum-discovery")]
                     let discovery = discovery.clone();
-                    let rpc_logging = config.electrum_rpc_logging.clone();
+
+                    let (sender, receiver) = mpsc::sync_channel(10);
+                    senders.lock().unwrap().push(sender.clone());
+
+                    let salt = salt_rwlock.read().unwrap().clone();
 
                     let spawned = spawn_thread("peer", move || {
                         info!("[{}] connected peer", addr);
@@ -807,14 +875,15 @@ impl RPC {
                             query,
                             stream,
                             addr,
+                            sender,
                             stats,
                             txs_limit,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
                             rpc_logging,
+                            salt,
                         );
-                        senders.lock().unwrap().push(conn.chan.sender());
-                        conn.run();
+                        conn.run(receiver);
                         info!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });
